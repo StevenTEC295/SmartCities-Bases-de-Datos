@@ -55,10 +55,40 @@ services:
       - spark.sql.shuffle.partitions=8
       - --conf
       - spark.hadoop.fs.defaultFS=hdfs://namenode:9000
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2        # carpeta escribible para bajar los drivers
+      - --packages
+      - org.postgresql:postgresql:42.7.4,org.mongodb.spark:mongo-spark-connector_2.13:10.5.0
     ports:
       - "15002:15002"   # Spark Connect: sc://localhost:15002
       - "4040:4040"     # interfaz web de Spark
 
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: smartcities
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    hostname: mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+
 volumes:
+  postgres_data:
+  mongo_data:
   namenode_data:
   datanode_data:
