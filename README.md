@@ -4,6 +4,8 @@ Entorno local de un solo nodo para almacenar datasets en **HDFS** y consultarlos
 
 > Pensado para desarrollo y aprendizaje. Es un clúster de un solo nodo, no un entorno de producción.
 
+Además de HDFS y Spark, el entorno incluye **PostgreSQL** (tablas estructuradas) y **MongoDB** (mediciones) para distribuir los datos ya limpios. Ver el [Paso 6].
+
 ## Arquitectura
 
 ```
@@ -15,6 +17,9 @@ Tu código Python (notebook, Streamlit, Dash...)
 │      │  hdfs://namenode:9000          │
 │      ▼                                │
 │  namenode  ◄──►  datanode  (HDFS)     │
+│      │                                │
+│      ├──► postgres  (tablas 3FN)      │
+│      └──► mongo     (mediciones)      │
 └───────────────────────────────────────┘
         ▲
         │  carpeta ./datasets montada en /datasets
@@ -26,6 +31,10 @@ Tu código Python (notebook, Streamlit, Dash...)
 | `namenode` | Metadatos de HDFS e interfaz web | `9870` (web), `9000` (HDFS) |
 | `datanode` | Almacena los bloques de datos | `9864`, `9866` |
 | `spark` | Servidor Spark Connect | `15002` (conexión), `4040` (web) |
+| `postgres` | Base de datos relacional (tablas estructuradas) | `5433` |
+| `mongo` | Base de datos de documentos (mediciones) | `27018` |
+
+PostgreSQL y MongoDB usan `5433` y `27018` en tu PC, y no los puertos habituales (`5432` y `27017`), para no chocar con instalaciones locales. Dentro de Docker siguen en `5432` y `27017`.
 
 ## Requisitos
 
@@ -50,6 +59,10 @@ docker compose version
 mi-proyecto/
 ├── docker-compose.yml
 ├── README.md
+├── db/
+│   └── init.sql           <- crea las tablas de PostgreSQL la primera vez
+├── notebooks/
+│   └── limpieza.ipynb     <- limpieza, normalización 3FN y carga a las bases
 └── datasets/              <- tus archivos CSV (se monta en el contenedor)
     └── mi_dataset.csv
 ```
@@ -147,6 +160,43 @@ sdf = spark.read.parquet("hdfs://namenode:9000/data/processed/mi_dataset")
 
 Como Spark corre en Linux dentro de Docker, la escritura funciona sin configurar `winutils` ni `HADOOP_HOME`, que son necesarios con Spark nativo en Windows.
 
+## Paso 6. Limpiar y distribuir en PostgreSQL y MongoDB
+
+El notebook [notebooks/limpieza.ipynb](notebooks/limpieza.ipynb) limpia el dataset, lo normaliza hasta **3FN** y distribuye el resultado. Se ejecuta de arriba abajo, con los contenedores arriba y el CSV ya subido a HDFS.
+
+| Tabla | Destino | Contenido |
+|---|---|---|
+| `locations` | PostgreSQL | ubicaciones de medición |
+| `parametros` | PostgreSQL | contaminante y su unidad |
+| `sensores` | PostgreSQL | parámetro que mide cada sensor y su ubicación |
+| `mediciones` | MongoDB | lecturas: `sensor_id`, `datetime_utc`, `value` |
+
+El resultado limpio también queda como Parquet en `/data/processed`, que sirve para recargar las bases sin repetir la limpieza.
+
+Si el notebook se queda con una sesión vieja tras reiniciar Spark (`NO_ACTIVE_SESSION`), reiniciá el kernel y ejecutalo de nuevo desde arriba.
+
+### Verificar los datos
+
+Las bases se acceden desde tu PC con cualquier cliente (pgAdmin, DBeaver, MongoDB Compass o sus extensiones de VS Code):
+
+| Base | Conexión |
+|---|---|
+| PostgreSQL | host `localhost`, puerto `5433`, base `smartcities`, usuario `postgres`, contraseña `postgres` |
+| MongoDB | `mongodb://localhost:27018`, base `smartcities`, colección `mediciones` |
+
+Por terminal:
+
+```bash
+docker exec -it postgres psql -U postgres -d smartcities
+docker exec -it mongo mongosh smartcities
+```
+
+Para **repetir la carga** en PostgreSQL hay que vaciar las tablas antes, todas juntas por las claves foráneas:
+
+```bash
+docker exec postgres psql -U postgres -d smartcities -c "TRUNCATE sensores, parametros, locations"
+```
+
 ## Buenas prácticas con DataFrames
 
 - Procesá en Spark (`filter`, `groupBy`, `join`, `sql`) y convertí a pandas **solo resultados pequeños** para mostrarlos.
@@ -170,7 +220,7 @@ resumen.toPandas()
 | Abrir una terminal en el namenode | `docker exec -it namenode bash` |
 | Listar HDFS completo | `docker exec namenode hdfs dfs -ls -R -h /` |
 
-Los datos de HDFS viven en volúmenes de Docker y se conservan al apagar. **Solo se pierden con `docker compose down -v`.**
+Los datos de HDFS, PostgreSQL y MongoDB viven en volúmenes de Docker y se conservan al apagar. **Solo se pierden con `docker compose down -v`.**
 
 ## Empezar de cero
 
@@ -214,6 +264,8 @@ El compose usa `container_name` fijo, así que solo puede haber un clúster acti
 | Error de conexión a `sc://localhost:15002` | Spark aún no está listo o se cayó. Revisá `docker compose logs spark`. |
 | `PACKAGE_NOT_INSTALLED ... zstandard` o errores de `grpc` / `protobuf` | Dependencias del cliente en conflicto. Usá un entorno virtual limpio con `pip install "pyspark[connect]==4.0.0"`. |
 | `Conflict. The container name "/namenode" is already in use` | Quedó un contenedor viejo. Ejecutá `docker rm -f namenode datanode spark`. |
+| pgAdmin da `la autentificación password falló`, o Compass conecta pero no muestra bases | Estás llegando a un PostgreSQL o MongoDB instalado en tu PC, no al contenedor. Usá los puertos `5433` y `27018`, y verificá que los contenedores se hayan recreado con `docker compose up -d`. |
+| `NO_ACTIVE_SESSION` en el notebook | El servidor Spark se reinició. Reiniciá el kernel del notebook y ejecutalo de nuevo. |
 | `port is already allocated` | Otro programa usa ese puerto. Cambiá el número de la izquierda en `ports`. |
 | Docker o Spark muy lentos, `OutOfMemoryError` | Poca memoria. Bajá `--driver-memory`, cerrá otras aplicaciones o limitá WSL2 con `memory=8GB` en `%UserProfile%\.wslconfig` y ejecutá `wsl --shutdown`. |
 | Advertencias sobre pandas 3.0 | PySpark todavía no lo soporta por completo. Usá `pandas<3.0`. |
@@ -222,7 +274,7 @@ El compose usa `container_name` fijo, así que solo puede haber un clúster acti
 
 - Las imágenes `bde2020/hadoop-*` usan Hadoop 3.2.1 y ya no reciben actualizaciones. Funcionan bien para un nodo de desarrollo. Spark 4 incluye un cliente de Hadoop más nuevo, algo que normalmente es compatible.
 - Con un solo datanode la replicación está en 1, por lo que no hay redundancia de datos.
-- La seguridad está desactivada (`dfs.permissions.enabled=false`). No expongas estos puertos a una red pública.
+- La seguridad está desactivada (`dfs.permissions.enabled=false`). PostgreSQL usa credenciales de ejemplo (`postgres`/`postgres`) y MongoDB no tiene autenticación. No expongas estos puertos a una red pública.
 - HDFS está pensado para pocos archivos grandes. Muchos archivos de pocos MB afectan el rendimiento.
 
 ## Documentación oficial
