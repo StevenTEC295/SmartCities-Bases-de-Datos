@@ -2,7 +2,9 @@
 
 CREATE TABLE locations (
     location_id   INTEGER PRIMARY KEY,
-    location_name TEXT NOT NULL UNIQUE
+    location_name TEXT NOT NULL UNIQUE,
+    latitude      DOUBLE PRECISION,   -- coordenadas de la estacion (EPA AQS, WGS84)
+    longitude     DOUBLE PRECISION
 );
 
 CREATE TABLE parametros (

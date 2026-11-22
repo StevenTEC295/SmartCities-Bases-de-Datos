@@ -9,8 +9,8 @@ SELECT
     'contaminacion'::text         AS fuente,
     s.sensor_id::text             AS sensor_id,
     l.location_name               AS nombre,
-    NULL::double precision        AS latitude,    -- el CSV de contaminacion no trae coordenadas
-    NULL::double precision        AS longitude,
+    l.latitude                    AS latitude,    -- coordenadas de la ubicacion (tabla locations)
+    l.longitude                   AS longitude,
     s.location_id                 AS location_id, -- se conserva la referencia a locations
     s.parameter_id                AS parameter_id, -- se conserva la referencia a parametros
     p.parameter                   AS parametro,
