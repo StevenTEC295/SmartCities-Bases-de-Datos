@@ -1,11 +1,11 @@
-import streamlit as st
 from pyspark.sql import DataFrame, SparkSession
 
 
 class Queries_PG:
-    """Consultas a Postgres usando Spark + JDBC (vía Spark Connect)."""
-
-    
+    """
+    Consultas a PostgreSQL usando Spark + JDBC (vía Spark Connect).
+    Todos los métodos devuelven DataFrames de Spark.
+    """
 
     def __init__(self, spark: SparkSession, url: str, user, password, driver):
         self.spark = spark
@@ -25,20 +25,35 @@ class Queries_PG:
             .load()
         )
 
-    @st.cache_data(show_spinner="Consultando Postgres...")
-    def consultar(_self, sql: str) -> DataFrame:
-        """Ejecuta cualquier SELECT en Postgres y devuelve un DataFrame de pandas."""
-        return _self._leer(sql).toDF()
+    def consultar(self, sql: str) -> DataFrame:
+        """Ejecuta un SELECT en PostgreSQL (el trabajo lo hace la base) y devuelve un DataFrame de Spark."""
+        sql = sql.strip().rstrip(";")   # la opción JDBC `query` no admite punto y coma final
+        if not sql:
+            raise ValueError("El SQL está vacío")
+        return self._leer(sql)
 
-    # ---- Consultas de ejemplo: cambia tabla y columnas por las de tu esquema ----
-    def top_productos(self, n: int = 10) -> DataFrame:
+    # ---- Consultas de ejemplo sobre el esquema de db/init.sql y db/accidents.sql ----
+    def top_ubicaciones(self, n: int = 10) -> DataFrame:
+        """Ubicaciones con más sensores."""
         n = int(n)
         return self.consultar(
             f"""
-            SELECT producto, SUM(ingresos) AS ingresos
-            FROM ventas
-            GROUP BY producto
-            ORDER BY ingresos DESC
+            SELECT l.location_name, COUNT(s.sensor_id) AS sensores
+            FROM locations l
+            JOIN sensores s ON s.location_id = l.location_id
+            GROUP BY l.location_name
+            ORDER BY sensores DESC
             LIMIT {n}
+            """
+        )
+
+    def accidentes_por_severidad(self) -> DataFrame:
+        """Número de accidentes por nivel de severidad."""
+        return self.consultar(
+            """
+            SELECT severity, COUNT(*) AS accidentes
+            FROM accidents
+            GROUP BY severity
+            ORDER BY severity
             """
         )

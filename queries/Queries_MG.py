@@ -1,7 +1,5 @@
 import json
 
-import pandas as pd
-import streamlit as st
 from pyspark.sql import DataFrame, SparkSession
 
 
@@ -10,6 +8,7 @@ class Queries_MG:
     Consultas a MongoDB SOLO con Aggregation Framework.
     Cada consulta es un pipeline (lista de etapas) que se ejecuta dentro de Mongo
     mediante mongo-spark-connector 10.x, vía Spark Connect.
+    Todos los métodos devuelven DataFrames de Spark.
     """
 
     # El dashboard es de solo lectura: se rechazan las etapas que escriben datos
@@ -47,20 +46,19 @@ class Queries_MG:
         # _id llega como struct (ObjectId) y no se grafica bien: se descarta si quedó
         return df.drop("_id") if "_id" in df.columns else df
 
-    @st.cache_data(show_spinner="Ejecutando aggregation en MongoDB...")
-    def agregar(_self, coleccion: str, pipeline: list) -> pd.DataFrame:
-        """Ejecuta un pipeline de agregación y devuelve el resultado como pandas."""
-        return _self._agregar(coleccion, pipeline).toPandas()
+    def agregar(self, coleccion: str, pipeline: list) -> DataFrame:
+        """Ejecuta un pipeline de agregación y devuelve el resultado como DataFrame de Spark."""
+        return self._agregar(coleccion, pipeline)
 
     # ---------- Consultas de ejemplo (cambia colección y campos por los de tu base) ----------
-    def conteo_por_campo(self, coleccion: str, campo: str) -> pd.DataFrame:
+    def conteo_por_campo(self, coleccion: str, campo: str) -> DataFrame:
         return self.agregar(coleccion, [
             {"$group": {"_id": f"${campo}", "total": {"$sum": 1}}},
             {"$project": {"_id": 0, campo: "$_id", "total": 1}},
             {"$sort": {"total": -1}},
         ])
 
-    def top_n(self, coleccion: str, campo_grupo: str, campo_valor: str, n: int = 10) -> pd.DataFrame:
+    def top_n(self, coleccion: str, campo_grupo: str, campo_valor: str, n: int = 10) -> DataFrame:
         return self.agregar(coleccion, [
             {"$group": {"_id": f"${campo_grupo}", "total": {"$sum": f"${campo_valor}"}}},
             {"$sort": {"total": -1}},
@@ -68,7 +66,7 @@ class Queries_MG:
             {"$project": {"_id": 0, campo_grupo: "$_id", "total": 1}},
         ])
 
-    def serie_diaria(self, coleccion: str, campo_fecha: str, campo_valor: str) -> pd.DataFrame:
+    def serie_diaria(self, coleccion: str, campo_fecha: str, campo_valor: str) -> DataFrame:
         # Requiere que campo_fecha sea tipo Date en Mongo (si es texto, usa {"$toDate": ...})
         return self.agregar(coleccion, [
             {"$group": {
