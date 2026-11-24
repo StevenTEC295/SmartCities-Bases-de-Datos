@@ -1,12 +1,27 @@
-import pandas as pd
+import io
+import json
+from contextlib import redirect_stdout
+from decimal import Decimal
+
 import streamlit as st
 
 
 class Dashboard:
-    """Dashboard de ventas en una sola clase."""
+    """
+    Versión de PRUEBAS del dashboard.
 
-    PRECIOS = {"Producto A": 20, "Producto B": 35, "Producto C": 50}
-    REGIONES = ["Norte", "Sur", "Este", "Oeste"]
+    Ejecuta, uno por uno, los métodos actuales de las cuatro clases de consultas
+    (Queries_SP, Queries_PG, Queries_MG y Queries_HDFS) y muestra el resultado.
+
+    - Los DataFrames de Spark se muestran tomando sus primeras filas con
+      `limit().collect()` y pasándolas a Streamlit como lista de diccionarios.
+    - Si un método falla, se muestra el error completo en pantalla: en una prueba
+      eso es justo lo que se quiere ver.
+    - Si un método devuelve algo que no es un DataFrame de Spark, se muestra tal cual
+      y se avisa del tipo de objeto recibido.
+    """
+
+    LIMITE_FILAS = 500
 
     def __init__(
         self,
@@ -14,133 +29,206 @@ class Dashboard:
         queries_pg,
         queries_mg,
         queries_hdfs,
-        titulo: str = "Dashboard de SmartCities",
-        icono: str = "📊",
+        titulo: str = "Dashboard de SmartCities (pruebas)",
+        icono: str = "🧪",
     ):
-        self.queries = queries          # Queries_SP (Spark)
-        self.queries_pg = queries_pg    # Queries_PG (Postgres vía JDBC)
-        self.queries_mg = queries_mg    # Queries_MG (MongoDB)
+        self.queries = queries            # Queries_SP   (Spark sobre archivos)
+        self.queries_pg = queries_pg      # Queries_PG   (PostgreSQL vía JDBC)
+        self.queries_mg = queries_mg      # Queries_MG   (MongoDB, Aggregation Framework)
         self.queries_hdfs = queries_hdfs  # Queries_HDFS (comandos HDFS + MapReduce)
         self.titulo = titulo
         self.icono = icono
-        self.df = self.queries.ventas_diarias()
 
-    # ---------- Filtros ----------
-    def _filtrar(self) -> pd.DataFrame:
-        st.sidebar.header("Filtros")
-        df = self.df
+    # =====================================================================
+    #  Utilidades
+    # =====================================================================
+    @staticmethod
+    def _spec(texto: str):
+        """'3' -> posición 3; 'region' -> nombre de columna."""
+        texto = texto.strip()
+        return int(texto) if texto.isdigit() else texto
 
-        fmin, fmax = df["fecha"].min(), df["fecha"].max()
-        rango = st.sidebar.date_input(
-            "Rango de fechas", value=(fmin, fmax), min_value=fmin, max_value=fmax
-        )
-        if isinstance(rango, tuple) and len(rango) == 2:
-            inicio, fin = pd.to_datetime(rango[0]), pd.to_datetime(rango[1])
-        else:  # el usuario aún está eligiendo la segunda fecha
-            inicio, fin = fmin, fmax
+    def _filas(self, sdf) -> list:
+        """
+        Primeras filas de un DataFrame de Spark como lista de diccionarios.
+        Los Decimal (resultado habitual de sum/avg en Spark) pasan a float para poder graficarse.
+        """
+        filas = []
+        for fila in sdf.limit(self.LIMITE_FILAS).collect():
+            d = fila.asDict(recursive=True)
+            filas.append({k: float(v) if isinstance(v, Decimal) else v for k, v in d.items()})
+        return filas
 
-        regiones = sorted(df["region"].unique())
-        productos = sorted(df["producto"].unique())
-        regiones_sel = st.sidebar.multiselect("Región", regiones, default=regiones)
-        productos_sel = st.sidebar.multiselect("Producto", productos, default=productos)
+    def _probar_spark(self) -> str:
+        """Ejecuta Queries_SP.probar() y devuelve lo que imprime (show() escribe en consola)."""
+        salida = io.StringIO()
+        with redirect_stdout(salida):
+            self.queries.probar()
+        return salida.getvalue() or "probar() se ejecutó sin imprimir nada."
 
-        mask = (
-            df["fecha"].between(inicio, fin)
-            & df["region"].isin(regiones_sel)
-            & df["producto"].isin(productos_sel)
-        )
-        return df[mask]
-
-    # ---------- Secciones ----------
-    def _kpis(self, df: pd.DataFrame) -> None:
-        ingresos = df["ingresos"].sum()
-        unidades = df["unidades"].sum()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Ingresos totales", f"${ingresos:,.0f}")
-        c2.metric("Unidades vendidas", f"{unidades:,.0f}")
-        c3.metric("Precio promedio por unidad", f"${ingresos / unidades:,.2f}")
-
-    def _graficos(self, df: pd.DataFrame) -> None:
-        izq, der = st.columns(2)
-        with izq:
-            st.subheader("Ingresos por mes")
-            st.line_chart(df.set_index("fecha")["ingresos"].resample("MS").sum())
-        with der:
-            st.subheader("Ingresos por región")
-            st.bar_chart(df.groupby("region")["ingresos"].sum().sort_values(ascending=False))
-
-        st.subheader("Ingresos por producto y región")
-        st.bar_chart(
-            df.pivot_table(index="region", columns="producto", values="ingresos", aggfunc="sum")
-        )
-
-    def _top_productos_pg(self) -> None:
-        st.subheader("Top productos (desde Postgres)")
-        top = self.queries_pg.top_productos(n=5)
-        st.bar_chart(top.set_index("producto")["ingresos"])
-
-    def _consultas_hadoop(self) -> None:
-        st.subheader("Consultas MapReduce (Hadoop sobre HDFS)")
-        carpeta = st.text_input("Carpeta en HDFS", self.queries_hdfs.base_uri, key="mr_carpeta")
-        try:
-            items = self.queries_hdfs.listar(carpeta)
-        except RuntimeError as e:
-            st.error(str(e))
-            return
-        if items.empty:
-            st.info("La carpeta está vacía.")
-            return
-
-        ruta = st.selectbox("Archivo o carpeta de datos", items["ruta"], key="mr_ruta")
-        c1, c2, c3 = st.columns(3)
-        grupo = c1.text_input("Columna de grupo (nombre o posición)", key="mr_grupo")
-        valor = c2.text_input("Columna de valor (nombre o posición)", key="mr_valor")
-        operacion = c3.selectbox("Operación", ["sum", "count", "avg", "min", "max"], key="mr_op")
-        encabezado = st.checkbox("El archivo tiene encabezado", value=True, key="mr_enc")
-
-        if st.button("Ejecutar MapReduce", disabled=not (grupo and valor)):
-            def spec(x: str):                       # "3" -> posición 3; "region" -> nombre
-                x = x.strip()
-                return int(x) if x.isdigit() else x
+    def _ejecutar(self, clave: str, etiqueta: str, funcion, deshabilitado: bool = False) -> None:
+        """
+        Botón que ejecuta `funcion` y muestra su resultado o el error completo.
+        El resultado queda guardado en session_state para que sobreviva a los cambios de widgets.
+        """
+        if st.button(etiqueta, key=f"btn_{clave}", disabled=deshabilitado):
             try:
-                st.session_state["mr_resultado"] = self.queries_hdfs.agrupar(
-                    ruta, spec(grupo), spec(valor), operacion, encabezado=encabezado
-                )
-            except (RuntimeError, ValueError) as e:
-                st.session_state.pop("mr_resultado", None)
-                st.error(str(e))
+                with st.spinner("Ejecutando..."):
+                    st.session_state[f"res_{clave}"] = funcion()
+                st.session_state.pop(f"err_{clave}", None)
+            except Exception as e:  # noqa: BLE001 - en pruebas se quiere ver cualquier fallo
+                st.session_state[f"err_{clave}"] = e
+                st.session_state.pop(f"res_{clave}", None)
 
-        resultado = st.session_state.get("mr_resultado")
-        if resultado is not None:
-            st.dataframe(resultado, width="stretch")
-            if not resultado.empty:
-                st.bar_chart(resultado.set_index(resultado.columns[0]).iloc[:, 0])
+        if f"err_{clave}" in st.session_state:
+            st.exception(st.session_state[f"err_{clave}"])
+        elif f"res_{clave}" in st.session_state:
+            self._mostrar(clave, st.session_state[f"res_{clave}"])
 
-    def _tabla(self, df: pd.DataFrame) -> None:
-        with st.expander("Ver datos detallados"):
-            st.dataframe(df.sort_values("fecha", ascending=False), width="stretch")
-            st.download_button(
-                "Descargar CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                file_name="ventas_filtradas.csv",
-                mime="text/csv",
+    def _mostrar(self, clave: str, resultado) -> None:
+        if resultado is None:
+            st.info("El método se ejecutó y devolvió None.")
+        elif hasattr(resultado, "collect"):  # DataFrame de Spark
+            filas = self._filas(resultado)
+            st.caption(
+                f"DataFrame de Spark · columnas: {', '.join(resultado.columns)} · "
+                f"se muestran hasta {self.LIMITE_FILAS} filas"
             )
+            st.dataframe(filas, width="stretch")
+            self._graficar(clave, list(resultado.columns), filas)
+        elif isinstance(resultado, str):
+            st.code(resultado)
+        elif isinstance(resultado, (bool, int, float)):
+            st.write(resultado)
+        else:  # lo que devuelva el método, sin transformarlo
+            tipo = f"{type(resultado).__module__}.{type(resultado).__name__}"
+            st.warning(f"El método devolvió un objeto de tipo {tipo}, no un DataFrame de Spark.")
+            st.dataframe(resultado, width="stretch")
 
-    # ---------- Ejecución ----------
+    def _graficar(self, clave: str, columnas: list, filas: list) -> None:
+        if not filas or len(columnas) < 2:
+            return
+        with st.expander("Graficar"):
+            c1, c2, c3 = st.columns(3)
+            x = c1.selectbox("Eje X", columnas, key=f"x_{clave}")
+            y = c2.selectbox("Eje Y (numérico)", columnas, index=1, key=f"y_{clave}")
+            tipo = c3.selectbox("Tipo", ["barras", "línea"], key=f"t_{clave}")
+            try:
+                grafico = st.bar_chart if tipo == "barras" else st.line_chart
+                grafico(filas, x=x, y=y)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"No se pudo graficar con esas columnas: {e}")
+
+    # =====================================================================
+    #  Pestañas (una por clase de consultas)
+    # =====================================================================
+    def _tab_spark(self) -> None:
+        st.caption("Queries_SP: `probar()` y `sensoresTipo()`")
+        st.subheader("probar()")
+        self._ejecutar("sp_probar", "Ejecutar probar()", self._probar_spark)
+        st.subheader("sensoresTipo()")
+        self._ejecutar("sp_tipo", "Ejecutar sensoresTipo()", self.queries.sensoresTipo)
+
+    def _tab_postgres(self) -> None:
+        st.caption("Queries_PG: `consultar(sql)`, `top_ubicaciones(n)` y `accidentes_por_severidad()`")
+        st.subheader("consultar(sql)")
+        sql = st.text_area(
+            "SQL (solo SELECT)",
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            key="pg_sql",
+        )
+        self._ejecutar("pg_consultar", "Ejecutar consultar(sql)",
+                       lambda: self.queries_pg.consultar(sql), deshabilitado=not sql.strip())
+
+        st.subheader("top_ubicaciones(n)")
+        n = st.number_input("n", min_value=1, max_value=100, value=5, key="pg_n")
+        self._ejecutar("pg_top", "Ejecutar top_ubicaciones(n)",
+                       lambda: self.queries_pg.top_ubicaciones(int(n)))
+
+        st.subheader("accidentes_por_severidad()")
+        self._ejecutar("pg_sev", "Ejecutar accidentes_por_severidad()",
+                       self.queries_pg.accidentes_por_severidad)
+
+    def _tab_mongo(self) -> None:
+        st.caption("Queries_MG: `agregar`, `conteo_por_campo`, `top_n` y `serie_diaria`")
+        coleccion = st.text_input("Colección", "mediciones", key="mg_col")
+
+        st.subheader("agregar(coleccion, pipeline)")
+        pipeline = st.text_area("Pipeline (JSON)", '[{"$limit": 10}]', key="mg_pipe")
+        self._ejecutar("mg_agregar", "Ejecutar agregar()",
+                       lambda: self.queries_mg.agregar(coleccion, json.loads(pipeline)),
+                       deshabilitado=not coleccion.strip())
+
+        st.subheader("Consultas de ejemplo")
+        c1, c2, c3, c4 = st.columns(4)
+        campo = c1.text_input("Campo de grupo", key="mg_campo")
+        valor = c2.text_input("Campo numérico", key="mg_valor")
+        fecha = c3.text_input("Campo de fecha (tipo Date)", key="mg_fecha")
+        n = c4.number_input("n", min_value=1, max_value=100, value=10, key="mg_n")
+
+        self._ejecutar("mg_conteo", "conteo_por_campo(coleccion, campo)",
+                       lambda: self.queries_mg.conteo_por_campo(coleccion, campo),
+                       deshabilitado=not (coleccion and campo))
+        self._ejecutar("mg_top", "top_n(coleccion, campo, valor, n)",
+                       lambda: self.queries_mg.top_n(coleccion, campo, valor, int(n)),
+                       deshabilitado=not (coleccion and campo and valor))
+        self._ejecutar("mg_serie", "serie_diaria(coleccion, fecha, valor)",
+                       lambda: self.queries_mg.serie_diaria(coleccion, fecha, valor),
+                       deshabilitado=not (coleccion and fecha and valor))
+
+    def _tab_hdfs(self) -> None:
+        st.caption("Queries_HDFS: comandos `hdfs dfs` y consultas MapReduce")
+        ruta = st.text_input(
+            "Ruta (vacía = carpeta base; relativa, absoluta o hdfs://...)", "", key="hd_ruta"
+        )
+
+        st.subheader("Comandos de HDFS")
+        self._ejecutar("hd_listar", "listar(ruta)", lambda: self.queries_hdfs.listar(ruta))
+        self._ejecutar("hd_existe", "existe(ruta)", lambda: self.queries_hdfs.existe(ruta),
+                       deshabilitado=not ruta.strip())
+        self._ejecutar("hd_carpeta", "es_carpeta(ruta)", lambda: self.queries_hdfs.es_carpeta(ruta),
+                       deshabilitado=not ruta.strip())
+        filas = st.number_input("Filas a cargar", min_value=1, max_value=10000, value=100, key="hd_filas")
+        self._ejecutar("hd_csv", "cargar_csv(ruta, limite)",
+                       lambda: self.queries_hdfs.cargar_csv(ruta, limite=int(filas)),
+                       deshabilitado=not ruta.strip())
+
+        st.subheader("MapReduce (Hadoop)")
+        top = st.number_input("Palabras a mostrar", min_value=1, max_value=100, value=20, key="hd_top")
+        self._ejecutar("hd_wc", "contar_palabras(ruta, top)",
+                       lambda: self.queries_hdfs.contar_palabras(ruta, top=int(top)),
+                       deshabilitado=not ruta.strip())
+
+        c1, c2, c3 = st.columns(3)
+        grupo = c1.text_input("Columna de grupo (nombre o posición)", key="hd_grupo")
+        valor = c2.text_input("Columna de valor (nombre o posición)", key="hd_valor")
+        operacion = c3.selectbox("Operación", ["sum", "count", "avg", "min", "max"], key="hd_op")
+        encabezado = st.checkbox("El archivo tiene encabezado", value=True, key="hd_enc")
+        self._ejecutar(
+            "hd_agrupar", "agrupar(ruta, grupo, valor, operacion)",
+            lambda: self.queries_hdfs.agrupar(
+                ruta, self._spec(grupo), self._spec(valor), operacion, encabezado=encabezado
+            ),
+            deshabilitado=not (ruta.strip() and grupo and valor),
+        )
+
+    # =====================================================================
+    #  Ejecución
+    # =====================================================================
     def run(self) -> None:
         st.set_page_config(page_title=self.titulo, page_icon=self.icono, layout="wide")
-        filtrado = self._filtrar()
-
         st.title(f"{self.icono} {self.titulo}")
-        st.caption("Ejemplo con Streamlit, pandas y datos sintéticos.")
+        st.caption(
+            "Ejecuta los métodos actuales de cada clase de consultas. "
+            "Los resultados se muestran como DataFrames de Spark."
+        )
 
-        if filtrado.empty:
-            st.warning("No hay datos con los filtros seleccionados.")
-            return
-
-        self._kpis(filtrado)
-        st.divider()
-        self._graficos(filtrado)
-        self._top_productos_pg()
-        self._consultas_hadoop()
-        self._tabla(filtrado)
+        spark, pg, mg, hdfs = st.tabs(["Spark", "PostgreSQL", "MongoDB", "HDFS / Hadoop"])
+        with spark:
+            self._tab_spark()
+        with pg:
+            self._tab_postgres()
+        with mg:
+            self._tab_mongo()
+        with hdfs:
+            self._tab_hdfs()
