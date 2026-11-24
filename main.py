@@ -9,13 +9,14 @@ from queries import Queries_SP, Queries_PG, Queries_HDFS, Queries_MG
 env_path = Path(__file__).with_name(".env")
 
 load_dotenv(dotenv_path=env_path)
+
 HADOOP_URI = os.getenv("HADOOP_URI")
 spark_remote = os.getenv("SPARK_URL")
 @st.cache_resource
 def get_spark() -> SparkSession:
     return SparkSession.builder.remote(spark_remote).getOrCreate()
 spark = get_spark()
-queries_sp = Queries_SP(spark=get_spark(), ruta= HADOOP_URI)
+queries_sp = Queries_SP(spark=spark, ruta= HADOOP_URI)
 queries_pg = Queries_PG(
     spark=spark,
     url=os.getenv("POSTGRESS_URL"),
