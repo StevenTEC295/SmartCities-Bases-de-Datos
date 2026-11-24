@@ -30,7 +30,7 @@ queries_mg = Queries_MG(
 )
 
 # HDFS: consultas genéricas sobre archivos (listar, cargar, agrupar)
-queries_hdfs = Queries_HDFS(
+queries_hdfs = Queries_HDFS(spark,
     comando=os.getenv("HDFS_CMD", "docker exec namenode hdfs dfs"),
     comando_hadoop=os.getenv("HADOOP_CMD", "docker exec namenode hadoop"),
 )
