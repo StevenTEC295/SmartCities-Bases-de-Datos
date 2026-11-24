@@ -6,6 +6,8 @@ from pathlib import Path
 from Dashboard import Dashboard
 from queries import Queries_SP, Queries_PG, Queries_HDFS, Queries_MG
 
+from Dashboard.Filtros import Filtros
+
 env_path = Path(__file__).with_name(".env")
 
 load_dotenv(dotenv_path=env_path)
@@ -36,7 +38,39 @@ queries_hdfs = Queries_HDFS(spark,
     comando_hadoop=os.getenv("HADOOP_CMD", "docker exec namenode hadoop"),
 )
 
+# Instanciacion del dashboard.
+
+filtro_zonas_validas = ["AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "IA", "ID", "IL", # Accidents data set 
+"IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ",
+"NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI",
+"WV", "WY", 
+
+"Boston - Roxbury", "Bronx - IS52", "McMillan Reservoir", "Essex",                                    # Pollution dataset
+
+"The Esplanade, Portarlington", "Mount Anakie, Anakie", "Sophie Way, Armstrong Creek",                # Australia Clima dataset
+"Challis Avenue, Breamlea", "Tower Road, Portarlington", "Jeffrey Street, Indented Head",
+"Adella Court, Moolap", "Spectacle Way, Leopold", "Seaspray Court, Indented Head",
+"The Esplanade, Indented Head"
+]
+
+filtro_origenes_validos = ["Departamento de transporte EE. UU.",    # Accidents data set 
+"Victorian Government, Australia",                                  # Australia Clima dataset 
+"Open AQ"]                                                          # Pollution dataset
+
+filtro_categorias_validas = ["accidentes",  # Accidents data set 
+    "temperature", "humidity",              # Australia Clima dataset 
+    "o3", "pm10", "pm25"]                   # Pollution dataset
+
+filtros = Filtros(
+    zonas_validas=filtro_zonas_validas,
+    origenes_validos=filtro_origenes_validos,
+    categorias_validas=filtro_categorias_validas,
+    max_ranking=10
+)
+
 Dashboard(queries=queries_sp, 
-          queries_pg=queries_pg,
-          queries_mg=queries_mg,
-          queries_hdfs=queries_hdfs).run()
+        queries_pg=queries_pg,
+        queries_mg=queries_mg,
+        queries_hdfs=queries_hdfs,
+        filtros=filtros).run()
+        
