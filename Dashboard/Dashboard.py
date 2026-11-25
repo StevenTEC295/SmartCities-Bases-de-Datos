@@ -121,6 +121,8 @@ class Dashboard:
             "vista_6_datos": None,
             "vista_6_total": None,
             "categoria_tendencia_2": "temperature",
+            "pg_datos": None,
+            "pg_numero": None,
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -1083,6 +1085,124 @@ class Dashboard:
                 )
 
     # ============================================================
+    # VISTA 7: CONSULTAS OBLIGATORIAS DE POSTGRESQL
+    # ============================================================
+
+    # Opciones del formulario de la consulta 9 (la vista sensores_unificados).
+    PG_FUENTES = ["Todas", "clima", "contaminacion"]
+    PG_PARAMETROS = ["Todos", "o3", "pm10", "pm25", "temperature", "humidity", "battery"]
+    PG_ORGANISMOS = ["Todos", "OpenAQ", "Victorian Government, Australia"]
+
+    # Columnas (etiqueta, valor) para graficar el resultado de cada consulta.
+    PG_EJES = {
+        1: ("parametro", "sensores"),
+        2: ("ubicacion", "sensores"),
+        4: ("organismo", "sensores"),
+        5: ("ubicacion", "sensores"),
+        10: ("severity", "accidentes"),
+    }
+
+    def consultar_postgres(self, numero, fuente=None, parametro=None, organismo=None):
+        """
+        Ejecuta una consulta obligatoria de PostgreSQL (Queries_PG.CONSULTAS).
+
+        La 5 usa la cantidad del ranking del panel; la 10 usa el rango de
+        fechas del panel y la zona si es un estado; la 9 recibe sus filtros.
+        """
+
+        if numero == 5:
+            resultado = self.queries_pg.ejecutar(
+                5, n=self.filtros.get_ranking_cantidad() or 10
+            )
+
+        elif numero == 9:
+            resultado = self.queries_pg.ejecutar(
+                9, fuente=fuente, parametro=parametro, organismo=organismo
+            )
+
+        elif numero == 10:
+            inicio, fin = self._rango_fechas()
+            resultado = self.queries_pg.ejecutar(
+                10,
+                fecha_ini=inicio.strftime("%Y-%m-%d"),
+                fecha_fin=fin.strftime("%Y-%m-%d"),
+                estado=self._zona("accidentes"),
+            )
+
+        else:
+            resultado = self.queries_pg.ejecutar(numero)
+
+        return self._a_pandas(resultado)
+
+    def mostrar_consultas_postgres(self):
+        st.subheader("7. Consultas obligatorias de PostgreSQL")
+        st.caption("Tecnología: PostgreSQL, consultado mediante Spark (JDBC).")
+
+        consultas = self.queries_pg.CONSULTAS
+
+        numero = st.selectbox(
+            "Consulta",
+            options=sorted(consultas),
+            format_func=lambda n: f"{n}. {consultas[n][0]}",
+            key="pg_consulta",
+        )
+
+        fuente = parametro = organismo = None
+
+        if numero == 9:
+            col_1, col_2, col_3 = st.columns(3)
+            fuente = col_1.selectbox("Fuente", self.PG_FUENTES, key="pg_fuente")
+            parametro = col_2.selectbox("Parámetro", self.PG_PARAMETROS, key="pg_parametro")
+            organismo = col_3.selectbox("Organismo", self.PG_ORGANISMOS, key="pg_organismo")
+
+            fuente = None if fuente == "Todas" else fuente
+            parametro = None if parametro == "Todos" else parametro
+            organismo = None if organismo == "Todos" else organismo
+
+        elif numero == 5:
+            st.caption(
+                "Usa la cantidad de ubicaciones del panel: "
+                f"{self.filtros.get_ranking_cantidad()}."
+            )
+
+        elif numero == 10:
+            inicio, fin = self._rango_fechas()
+            zona = self._zona("accidentes")
+            st.caption(
+                f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y}) y "
+                f"{'el estado ' + zona if zona else 'todos los estados'}."
+            )
+
+        if st.button("Ejecutar consulta", key="btn_pg"):
+            actualizado = self._ejecutar_consulta(
+                "pg_datos",
+                lambda: self.consultar_postgres(numero, fuente, parametro, organismo),
+            )
+
+            if actualizado:
+                st.session_state.pg_numero = numero
+
+        datos = st.session_state.pg_datos
+
+        if datos is None:
+            return
+
+        mostrada = st.session_state.pg_numero
+        st.markdown(f"**Resultado de la consulta {mostrada}: {consultas[mostrada][0]}**")
+
+        if datos.empty:
+            st.info("La consulta no devolvió resultados.")
+            return
+
+        if mostrada in self.PG_EJES:
+            etiqueta, valor = self.PG_EJES[mostrada]
+            grafico = datos[[etiqueta, valor]].copy()
+            grafico[etiqueta] = grafico[etiqueta].astype(str)
+            st.bar_chart(grafico.set_index(etiqueta))
+
+        st.dataframe(datos, use_container_width=True, hide_index=True)
+
+    # ============================================================
     # ACTUALIZAR TODAS LAS VISTAS
     # ============================================================
 
@@ -1341,3 +1461,7 @@ class Dashboard:
         st.divider()
 
         self.mostrar_vista_6()
+
+        st.divider()
+
+        self.mostrar_consultas_postgres()
