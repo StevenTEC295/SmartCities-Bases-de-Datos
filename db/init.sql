@@ -1,9 +1,8 @@
--- Esquema en 3FN. Se ejecuta solo la primera vez que se crea el volumen de PostgreSQL.
 
 CREATE TABLE locations (
     location_id   INTEGER PRIMARY KEY,
     location_name TEXT NOT NULL UNIQUE,
-    latitude      DOUBLE PRECISION,   -- coordenadas de la estacion (EPA AQS, WGS84)
+    latitude      DOUBLE PRECISION,   -- coordenadas de la estacion
     longitude     DOUBLE PRECISION
 );
 
