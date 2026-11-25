@@ -21,6 +21,8 @@ CREATE TABLE accidents (
     severity              INTEGER          NOT NULL,
     start_time            TIMESTAMP        NOT NULL,
     end_time              TIMESTAMP        NOT NULL,
+    start_time_utc        TIMESTAMP        NOT NULL,
+    end_time_utc          TIMESTAMP        NOT NULL,
     start_lat             DOUBLE PRECISION NOT NULL,
     start_lng             DOUBLE PRECISION NOT NULL,
     distance_mi           DOUBLE PRECISION NOT NULL,

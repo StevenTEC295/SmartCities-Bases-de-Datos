@@ -14,7 +14,7 @@ class Filtros:
 
         # Filter values (predetermined initial values)
         self._zona = None
-        self._fecha = (datetime(2025, 1, 1), datetime(2016, 1, 1))
+        self._fecha = (datetime(2016, 1, 14), datetime(2026, 11, 4))   
         self._origen = None
         self._categoria = None
         self._ranking_cantidad = 3
@@ -51,6 +51,11 @@ class Filtros:
     # -------------------------
 
     def set_zona(self, valor):
+        # None significa "todas las zonas" (sin filtro)
+        if valor is None:
+            self._zona = None
+            return True
+
         if not isinstance(valor, str) or valor not in self.zonas_validas:
             return False
 
@@ -78,6 +83,11 @@ class Filtros:
 
 
     def set_origen(self, valor):
+        # None significa "todos los orígenes" (sin filtro)
+        if valor is None:
+            self._origen = None
+            return True
+
         if not isinstance(valor, str) or valor not in self.origenes_validos:
             return False
 

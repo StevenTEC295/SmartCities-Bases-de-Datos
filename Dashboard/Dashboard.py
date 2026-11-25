@@ -6,6 +6,13 @@ import pandas as pd
 import streamlit as st
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 
 class Dashboard:
@@ -31,6 +38,8 @@ class Dashboard:
     """
 
     LIMITE_FILAS = 500
+    
+    LIMITE_SERIE = 5000
     LIMITE_EVENTOS = 10
 
     COLECCION_CLIMA = "clima_measurements"
@@ -52,9 +61,20 @@ class Dashboard:
         "Open AQ",
     ]
 
-    # Rango inicial del selector de fechas.
-    # Ajustar si los datasets tienen fechas fuera de este intervalo.
-    FECHA_MINIMA = date(2015, 1, 1)
+    # Rango real de los datos: desde el accidente más antiguo (2016-01-14)
+    # hasta la última medición de contaminación (2026-11-04).
+
+    FECHA_MINIMA = date(2016, 1, 14)
+    FECHA_MAXIMA = date(2026, 11, 4)
+
+    # Zonas del dataset de contaminación. Las de accidentes son códigos de estado
+    # de 2 letras (MA, NY...) y el resto son los dispositivos de clima.
+    ZONAS_CONTAMINACION = (
+        "Boston - Roxbury",
+        "Bronx - IS52",
+        "McMillan Reservoir",
+        "Essex",
+    )
 
     def __init__(
         self,
@@ -101,6 +121,8 @@ class Dashboard:
             "vista_6_datos": None,
             "vista_6_total": None,
             "categoria_tendencia_2": "temperature",
+            "pg_datos": None,
+            "pg_numero": None,
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -156,7 +178,18 @@ class Dashboard:
             return datetime.combine(fecha, time.min)
 
         raise ValueError("Fecha inválida")
+    @staticmethod
+    def _tiene_fechas_validas(df, col_fecha="fecha"):
+        if df is None or col_fecha not in df.columns:
+            return False
 
+        fila = (
+            df.select(F.col(col_fecha).cast("timestamp").alias("_f"))
+            .filter(F.col("_f").isNotNull())
+            .agg(F.min("_f").alias("f_min"))
+            .first()
+        )
+        return bool(fila and fila["f_min"] is not None)
     def _rango_fechas(self):
         """
         Obtiene el rango de fechas desde Filtros.
@@ -209,15 +242,20 @@ class Dashboard:
             }
         ]
 
-    def _a_pandas(self, spark_df):
+    def _a_pandas(self, spark_df, limite=None):
         """
         Convierte un Spark DataFrame a Pandas.
 
         Se utiliza después de agregar y limitar los resultados,
         no para descargar grandes colecciones completas.
+        Sin `limite` se usa LIMITE_FILAS (para tablas); las series
+        diarias pasan LIMITE_SERIE.
         """
 
-        return spark_df.limit(self.LIMITE_FILAS).toPandas()
+        if limite is None:
+            limite = self.LIMITE_FILAS
+
+        return spark_df.limit(limite).toPandas()
 
     def _origen_dataset(self):
         origen = self.filtros.get_origen()
@@ -259,8 +297,45 @@ class Dashboard:
                 "al origen seleccionado."
             )
 
-    def _zona(self):
-        return self.filtros.get_zona()
+    @classmethod
+    def _dataset_zona(cls, zona):
+        """Dataset al que pertenece una zona: accidentes (estado), contaminación o clima."""
+
+        if zona in cls.ZONAS_CONTAMINACION:
+            return "contaminacion"
+
+        if len(zona) == 2 and zona.isupper():
+            return "accidentes"
+
+        return "clima"
+
+    def _zonas_de_categoria(self, categoria):
+        """Zonas válidas para la categoría: solo las de su mismo dataset."""
+
+        dataset = self._dataset_categoria(categoria)
+
+        return [
+            zona
+            for zona in self.filtros.zonas_validas
+            if self._dataset_zona(zona) == dataset
+        ]
+
+    def _zona(self, dataset=None):
+        """
+        Zona seleccionada. Si se indica el dataset que se va a leer, devuelve
+        la zona solo cuando pertenece a ese dataset; si no, None (sin filtro de
+        zona). Así una zona de otro dataset no deja resultados vacíos.
+        """
+
+        zona = self.filtros.get_zona()
+
+        if zona is None or dataset is None:
+            return zona
+
+        if self._dataset_zona(zona) != dataset:
+            return None
+
+        return zona
 
     # ============================================================
     # LECTURA DE LOS DATASETS
@@ -293,10 +368,10 @@ class Dashboard:
               AND a.start_time <= '{fin_sql}'
         """
 
-        zona = self._zona()
+        zona = self._zona("accidentes")
 
         if zona is not None:
-            sql += f" AND c.state_code = '{self._sql_texto(zona)}'"
+            sql +=f" AND c.state_code = '{self._sql_texto(zona)}'"
 
         return self.queries_pg.consultar(sql)
 
@@ -316,6 +391,16 @@ class Dashboard:
             pipeline,
         )
 
+        if "dev_id" not in mediciones.columns:
+            esquema_vacio = StructType([
+                StructField("dev_id", StringType(), True),
+                StructField("name", StringType(), True),
+                StructField("time", TimestampType(), True),
+                StructField("temperature", DoubleType(), True),
+                StructField("humidity", DoubleType(), True),
+            ])
+            return self.queries_mg.spark.createDataFrame([], esquema_vacio)
+
         sensores = self.queries_pg.consultar("""
             SELECT
                 dev_id,
@@ -329,7 +414,7 @@ class Dashboard:
             how="inner",
         )
 
-        zona = self._zona()
+        zona = self._zona("clima")
 
         if zona is not None:
             resultado = resultado.filter(
@@ -337,7 +422,6 @@ class Dashboard:
             )
 
         return resultado
-
     def _leer_contaminacion(self):
         """
         Lee mediciones de contaminación desde MongoDB y las relaciona
@@ -373,7 +457,7 @@ class Dashboard:
             how="inner",
         )
 
-        zona = self._zona()
+        zona = self._zona("contaminacion")
 
         if zona is not None:
             resultado = resultado.filter(
@@ -430,6 +514,9 @@ class Dashboard:
         if categoria == "accidentes":
             df = self._columna_fecha(df, "start_time")
 
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
+
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
                 .groupBy("dia")
@@ -438,6 +525,9 @@ class Dashboard:
 
         elif categoria in ("temperature", "humidity"):
             df = self._columna_fecha(df, "time")
+
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
 
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
@@ -454,6 +544,9 @@ class Dashboard:
 
             df = self._columna_fecha(df, "datetime_utc")
 
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
+
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
                 .groupBy("dia")
@@ -464,8 +557,7 @@ class Dashboard:
 
         resultado = resultado.orderBy("dia")
 
-        return self._a_pandas(resultado)
-
+        return self._a_pandas(resultado, self.LIMITE_SERIE)
     # ============================================================
     # VISTA 1: CANTIDAD DE SENSORES POR TIPO
     # ============================================================
@@ -774,6 +866,17 @@ class Dashboard:
             if actualizado:
                 self.actualizar_correlacion()
 
+        zona_filtro = self.filtros.get_zona()
+
+        if (
+            zona_filtro is not None
+            and self._dataset_zona(zona_filtro) != self._dataset_categoria(categoria)
+        ):
+            st.caption(
+                f"La zona '{zona_filtro}' no pertenece al dataset de esta "
+                "categoría; esta tendencia usa todas sus zonas."
+            )
+
         datos = st.session_state.tendencia_2_datos
 
         if datos is not None:
@@ -982,6 +1085,124 @@ class Dashboard:
                 )
 
     # ============================================================
+    # VISTA 7: CONSULTAS OBLIGATORIAS DE POSTGRESQL
+    # ============================================================
+
+    # Opciones del formulario de la consulta 9 (la vista sensores_unificados).
+    PG_FUENTES = ["Todas", "clima", "contaminacion"]
+    PG_PARAMETROS = ["Todos", "o3", "pm10", "pm25", "temperature", "humidity", "battery"]
+    PG_ORGANISMOS = ["Todos", "OpenAQ", "Victorian Government, Australia"]
+
+    # Columnas (etiqueta, valor) para graficar el resultado de cada consulta.
+    PG_EJES = {
+        1: ("parametro", "sensores"),
+        2: ("ubicacion", "sensores"),
+        4: ("organismo", "sensores"),
+        5: ("ubicacion", "sensores"),
+        10: ("severity", "accidentes"),
+    }
+
+    def consultar_postgres(self, numero, fuente=None, parametro=None, organismo=None):
+        """
+        Ejecuta una consulta obligatoria de PostgreSQL (Queries_PG.CONSULTAS).
+
+        La 5 usa la cantidad del ranking del panel; la 10 usa el rango de
+        fechas del panel y la zona si es un estado; la 9 recibe sus filtros.
+        """
+
+        if numero == 5:
+            resultado = self.queries_pg.ejecutar(
+                5, n=self.filtros.get_ranking_cantidad() or 10
+            )
+
+        elif numero == 9:
+            resultado = self.queries_pg.ejecutar(
+                9, fuente=fuente, parametro=parametro, organismo=organismo
+            )
+
+        elif numero == 10:
+            inicio, fin = self._rango_fechas()
+            resultado = self.queries_pg.ejecutar(
+                10,
+                fecha_ini=inicio.strftime("%Y-%m-%d"),
+                fecha_fin=fin.strftime("%Y-%m-%d"),
+                estado=self._zona("accidentes"),
+            )
+
+        else:
+            resultado = self.queries_pg.ejecutar(numero)
+
+        return self._a_pandas(resultado)
+
+    def mostrar_consultas_postgres(self):
+        st.subheader("7. Consultas obligatorias de PostgreSQL")
+        st.caption("Tecnología: PostgreSQL, consultado mediante Spark (JDBC).")
+
+        consultas = self.queries_pg.CONSULTAS
+
+        numero = st.selectbox(
+            "Consulta",
+            options=sorted(consultas),
+            format_func=lambda n: f"{n}. {consultas[n][0]}",
+            key="pg_consulta",
+        )
+
+        fuente = parametro = organismo = None
+
+        if numero == 9:
+            col_1, col_2, col_3 = st.columns(3)
+            fuente = col_1.selectbox("Fuente", self.PG_FUENTES, key="pg_fuente")
+            parametro = col_2.selectbox("Parámetro", self.PG_PARAMETROS, key="pg_parametro")
+            organismo = col_3.selectbox("Organismo", self.PG_ORGANISMOS, key="pg_organismo")
+
+            fuente = None if fuente == "Todas" else fuente
+            parametro = None if parametro == "Todos" else parametro
+            organismo = None if organismo == "Todos" else organismo
+
+        elif numero == 5:
+            st.caption(
+                "Usa la cantidad de ubicaciones del panel: "
+                f"{self.filtros.get_ranking_cantidad()}."
+            )
+
+        elif numero == 10:
+            inicio, fin = self._rango_fechas()
+            zona = self._zona("accidentes")
+            st.caption(
+                f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y}) y "
+                f"{'el estado ' + zona if zona else 'todos los estados'}."
+            )
+
+        if st.button("Ejecutar consulta", key="btn_pg"):
+            actualizado = self._ejecutar_consulta(
+                "pg_datos",
+                lambda: self.consultar_postgres(numero, fuente, parametro, organismo),
+            )
+
+            if actualizado:
+                st.session_state.pg_numero = numero
+
+        datos = st.session_state.pg_datos
+
+        if datos is None:
+            return
+
+        mostrada = st.session_state.pg_numero
+        st.markdown(f"**Resultado de la consulta {mostrada}: {consultas[mostrada][0]}**")
+
+        if datos.empty:
+            st.info("La consulta no devolvió resultados.")
+            return
+
+        if mostrada in self.PG_EJES:
+            etiqueta, valor = self.PG_EJES[mostrada]
+            grafico = datos[[etiqueta, valor]].copy()
+            grafico[etiqueta] = grafico[etiqueta].astype(str)
+            st.bar_chart(grafico.set_index(etiqueta))
+
+        st.dataframe(datos, use_container_width=True, hide_index=True)
+
+    # ============================================================
     # ACTUALIZAR TODAS LAS VISTAS
     # ============================================================
 
@@ -1020,12 +1241,22 @@ class Dashboard:
     def mostrar_filtros(self):
         st.sidebar.header("Filtros globales")
 
-        # Zona
-        zonas = self.filtros.zonas_validas
+        # Zona: solo se ofrecen las zonas del dataset de la categoría elegida
+        
+        categoria_zonas = st.session_state.get(
+            "filtro_categoria",
+            self.filtros.categorias_validas[0],
+        )
+
+        zonas = self._zonas_de_categoria(categoria_zonas)
 
         zona_actual = self.filtros.get_zona()
 
         opciones_zona = ["Todas"] + list(zonas)
+
+        # Si la zona guardada ya no es válida para la categoría, vuelve a "Todas".
+        if st.session_state.get("filtro_zona", "Todas") not in opciones_zona:
+            st.session_state["filtro_zona"] = "Todas"
 
         if zona_actual not in zonas:
             zona_actual = "Todas"
@@ -1055,7 +1286,7 @@ class Dashboard:
             fecha_minima = fecha_minima.date()
 
         # Fecha máxima
-        fecha_maxima = date.today()
+        fecha_maxima = self.FECHA_MAXIMA
 
         # Normalizar fechas actuales
         if (
@@ -1182,6 +1413,7 @@ class Dashboard:
 
         self.filtros.set_umbral((activar, numero))
 
+
     # ============================================================
     # EJECUCIÓN DEL DASHBOARD
     # ============================================================
@@ -1229,3 +1461,7 @@ class Dashboard:
         st.divider()
 
         self.mostrar_vista_6()
+
+        st.divider()
+
+        self.mostrar_consultas_postgres()
