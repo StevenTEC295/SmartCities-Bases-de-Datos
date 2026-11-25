@@ -123,6 +123,7 @@ class Dashboard:
             "categoria_tendencia_2": "temperature",
             "pg_datos": None,
             "pg_numero": None,
+            "pg_criterio": "sensores",
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -1097,17 +1098,22 @@ class Dashboard:
     PG_EJES = {
         1: ("parametro", "sensores"),
         2: ("ubicacion", "sensores"),
+        3: ("estado", "sensores"),
         4: ("organismo", "sensores"),
         5: ("ubicacion", "sensores"),
+        6: ("anio", "sensores"),
+        8: ("zona", None),   # el valor es el criterio elegido (sensores o accidentes)
         10: ("severity", "accidentes"),
     }
 
-    def consultar_postgres(self, numero, fuente=None, parametro=None, organismo=None):
+    def consultar_postgres(self, numero, fuente=None, parametro=None, organismo=None,
+                           criterio="sensores"):
         """
         Ejecuta una consulta obligatoria de PostgreSQL (Queries_PG.CONSULTAS).
 
-        La 5 usa la cantidad del ranking del panel; la 10 usa el rango de
-        fechas del panel y la zona si es un estado; la 9 recibe sus filtros.
+        La 5 usa la cantidad del ranking del panel; la 3, 7, 8 y 10 usan el rango
+        de fechas del panel; la 8 también usa el máximo/mínimo del panel; la 10
+        usa la zona si es un estado; la 9 recibe sus filtros.
         """
 
         if numero == 5:
@@ -1120,14 +1126,23 @@ class Dashboard:
                 9, fuente=fuente, parametro=parametro, organismo=organismo
             )
 
-        elif numero == 10:
+        elif numero in (3, 7, 8, 10):
             inicio, fin = self._rango_fechas()
-            resultado = self.queries_pg.ejecutar(
-                10,
-                fecha_ini=inicio.strftime("%Y-%m-%d"),
-                fecha_fin=fin.strftime("%Y-%m-%d"),
-                estado=self._zona("accidentes"),
-            )
+            fechas = {
+                "fecha_ini": inicio.strftime("%Y-%m-%d"),
+                "fecha_fin": fin.strftime("%Y-%m-%d"),
+            }
+
+            if numero == 8:
+                fechas.update(
+                    n=self.filtros.get_ranking_cantidad() or 10,
+                    criterio=criterio,
+                    ascendente=not self.filtros.get_usar_maximo(),
+                )
+            elif numero == 10:
+                fechas["estado"] = self._zona("accidentes")
+
+            resultado = self.queries_pg.ejecutar(numero, **fechas)
 
         else:
             resultado = self.queries_pg.ejecutar(numero)
@@ -1148,6 +1163,7 @@ class Dashboard:
         )
 
         fuente = parametro = organismo = None
+        criterio = "sensores"
 
         if numero == 9:
             col_1, col_2, col_3 = st.columns(3)
@@ -1165,22 +1181,42 @@ class Dashboard:
                 f"{self.filtros.get_ranking_cantidad()}."
             )
 
-        elif numero == 10:
+        elif numero in (3, 7, 8, 10):
             inicio, fin = self._rango_fechas()
-            zona = self._zona("accidentes")
-            st.caption(
-                f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y}) y "
-                f"{'el estado ' + zona if zona else 'todos los estados'}."
-            )
+            texto = f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y})"
+
+            if numero == 8:
+                criterio = st.selectbox(
+                    "Ordenar zonas por",
+                    options=list(self.queries_pg.CRITERIOS_RANKING),
+                    key="pg_criterio_sel",
+                )
+                texto += (
+                    f", {self.filtros.get_ranking_cantidad()} zonas y "
+                    f"{'los valores máximos' if self.filtros.get_usar_maximo() else 'los valores mínimos'}"
+                )
+                st.caption(
+                    texto + ". Los sensores de clima (Australia) se asignan a zonas de forma simulada."
+                )
+
+            elif numero == 10:
+                zona = self._zona("accidentes")
+                st.caption(texto + f" y {'el estado ' + zona if zona else 'todos los estados'}.")
+
+            else:
+                st.caption(texto + ". Activo = tiene mediciones dentro del rango.")
 
         if st.button("Ejecutar consulta", key="btn_pg"):
             actualizado = self._ejecutar_consulta(
                 "pg_datos",
-                lambda: self.consultar_postgres(numero, fuente, parametro, organismo),
+                lambda: self.consultar_postgres(
+                    numero, fuente, parametro, organismo, criterio
+                ),
             )
 
             if actualizado:
                 st.session_state.pg_numero = numero
+                st.session_state.pg_criterio = criterio
 
         datos = st.session_state.pg_datos
 
@@ -1196,9 +1232,13 @@ class Dashboard:
 
         if mostrada in self.PG_EJES:
             etiqueta, valor = self.PG_EJES[mostrada]
+
+            if valor is None:
+                valor = st.session_state.pg_criterio
+
             grafico = datos[[etiqueta, valor]].copy()
             grafico[etiqueta] = grafico[etiqueta].astype(str)
-            st.bar_chart(grafico.set_index(etiqueta))
+            st.bar_chart(grafico.groupby(etiqueta, sort=False)[valor].sum())
 
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
