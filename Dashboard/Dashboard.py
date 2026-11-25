@@ -6,6 +6,13 @@ import pandas as pd
 import streamlit as st
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 
 class Dashboard:
@@ -31,6 +38,8 @@ class Dashboard:
     """
 
     LIMITE_FILAS = 500
+    
+    LIMITE_SERIE = 5000
     LIMITE_EVENTOS = 10
 
     COLECCION_CLIMA = "clima_measurements"
@@ -52,9 +61,20 @@ class Dashboard:
         "Open AQ",
     ]
 
-    # Rango inicial del selector de fechas.
-    # Ajustar si los datasets tienen fechas fuera de este intervalo.
-    FECHA_MINIMA = date(2015, 1, 1)
+    # Rango real de los datos: desde el accidente más antiguo (2016-01-14)
+    # hasta la última medición de contaminación (2026-11-04).
+
+    FECHA_MINIMA = date(2016, 1, 14)
+    FECHA_MAXIMA = date(2026, 11, 4)
+
+    # Zonas del dataset de contaminación. Las de accidentes son códigos de estado
+    # de 2 letras (MA, NY...) y el resto son los dispositivos de clima.
+    ZONAS_CONTAMINACION = (
+        "Boston - Roxbury",
+        "Bronx - IS52",
+        "McMillan Reservoir",
+        "Essex",
+    )
 
     def __init__(
         self,
@@ -220,15 +240,20 @@ class Dashboard:
             }
         ]
 
-    def _a_pandas(self, spark_df):
+    def _a_pandas(self, spark_df, limite=None):
         """
         Convierte un Spark DataFrame a Pandas.
 
         Se utiliza después de agregar y limitar los resultados,
         no para descargar grandes colecciones completas.
+        Sin `limite` se usa LIMITE_FILAS (para tablas); las series
+        diarias pasan LIMITE_SERIE.
         """
 
-        return spark_df.limit(self.LIMITE_FILAS).toPandas()
+        if limite is None:
+            limite = self.LIMITE_FILAS
+
+        return spark_df.limit(limite).toPandas()
 
     def _origen_dataset(self):
         origen = self.filtros.get_origen()
@@ -270,8 +295,45 @@ class Dashboard:
                 "al origen seleccionado."
             )
 
-    def _zona(self):
-        return self.filtros.get_zona()
+    @classmethod
+    def _dataset_zona(cls, zona):
+        """Dataset al que pertenece una zona: accidentes (estado), contaminación o clima."""
+
+        if zona in cls.ZONAS_CONTAMINACION:
+            return "contaminacion"
+
+        if len(zona) == 2 and zona.isupper():
+            return "accidentes"
+
+        return "clima"
+
+    def _zonas_de_categoria(self, categoria):
+        """Zonas válidas para la categoría: solo las de su mismo dataset."""
+
+        dataset = self._dataset_categoria(categoria)
+
+        return [
+            zona
+            for zona in self.filtros.zonas_validas
+            if self._dataset_zona(zona) == dataset
+        ]
+
+    def _zona(self, dataset=None):
+        """
+        Zona seleccionada. Si se indica el dataset que se va a leer, devuelve
+        la zona solo cuando pertenece a ese dataset; si no, None (sin filtro de
+        zona). Así una zona de otro dataset no deja resultados vacíos.
+        """
+
+        zona = self.filtros.get_zona()
+
+        if zona is None or dataset is None:
+            return zona
+
+        if self._dataset_zona(zona) != dataset:
+            return None
+
+        return zona
 
     # ============================================================
     # LECTURA DE LOS DATASETS
@@ -304,10 +366,10 @@ class Dashboard:
               AND a.start_time <= '{fin_sql}'
         """
 
-        zona = self._zona()
+        zona = self._zona("accidentes")
 
         if zona is not None:
-            sql += f" AND c.state_code = '{self._sql_texto(zona)}'"
+            sql +=f" AND c.state_code = '{self._sql_texto(zona)}'"
 
         return self.queries_pg.consultar(sql)
 
@@ -350,7 +412,7 @@ class Dashboard:
             how="inner",
         )
 
-        zona = self._zona()
+        zona = self._zona("clima")
 
         if zona is not None:
             resultado = resultado.filter(
@@ -393,7 +455,7 @@ class Dashboard:
             how="inner",
         )
 
-        zona = self._zona()
+        zona = self._zona("contaminacion")
 
         if zona is not None:
             resultado = resultado.filter(
@@ -493,7 +555,7 @@ class Dashboard:
 
         resultado = resultado.orderBy("dia")
 
-        return self._a_pandas(resultado)
+        return self._a_pandas(resultado, self.LIMITE_SERIE)
     # ============================================================
     # VISTA 1: CANTIDAD DE SENSORES POR TIPO
     # ============================================================
@@ -802,6 +864,17 @@ class Dashboard:
             if actualizado:
                 self.actualizar_correlacion()
 
+        zona_filtro = self.filtros.get_zona()
+
+        if (
+            zona_filtro is not None
+            and self._dataset_zona(zona_filtro) != self._dataset_categoria(categoria)
+        ):
+            st.caption(
+                f"La zona '{zona_filtro}' no pertenece al dataset de esta "
+                "categoría; esta tendencia usa todas sus zonas."
+            )
+
         datos = st.session_state.tendencia_2_datos
 
         if datos is not None:
@@ -1048,12 +1121,22 @@ class Dashboard:
     def mostrar_filtros(self):
         st.sidebar.header("Filtros globales")
 
-        # Zona
-        zonas = self.filtros.zonas_validas
+        # Zona: solo se ofrecen las zonas del dataset de la categoría elegida
+        
+        categoria_zonas = st.session_state.get(
+            "filtro_categoria",
+            self.filtros.categorias_validas[0],
+        )
+
+        zonas = self._zonas_de_categoria(categoria_zonas)
 
         zona_actual = self.filtros.get_zona()
 
         opciones_zona = ["Todas"] + list(zonas)
+
+        # Si la zona guardada ya no es válida para la categoría, vuelve a "Todas".
+        if st.session_state.get("filtro_zona", "Todas") not in opciones_zona:
+            st.session_state["filtro_zona"] = "Todas"
 
         if zona_actual not in zonas:
             zona_actual = "Todas"
@@ -1083,7 +1166,7 @@ class Dashboard:
             fecha_minima = fecha_minima.date()
 
         # Fecha máxima
-        fecha_maxima = date.today()
+        fecha_maxima = self.FECHA_MAXIMA
 
         # Normalizar fechas actuales
         if (
