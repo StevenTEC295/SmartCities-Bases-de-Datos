@@ -156,7 +156,18 @@ class Dashboard:
             return datetime.combine(fecha, time.min)
 
         raise ValueError("Fecha inválida")
+    @staticmethod
+    def _tiene_fechas_validas(df, col_fecha="fecha"):
+        if df is None or col_fecha not in df.columns:
+            return False
 
+        fila = (
+            df.select(F.col(col_fecha).cast("timestamp").alias("_f"))
+            .filter(F.col("_f").isNotNull())
+            .agg(F.min("_f").alias("f_min"))
+            .first()
+        )
+        return bool(fila and fila["f_min"] is not None)
     def _rango_fechas(self):
         """
         Obtiene el rango de fechas desde Filtros.
@@ -316,6 +327,16 @@ class Dashboard:
             pipeline,
         )
 
+        if "dev_id" not in mediciones.columns:
+            esquema_vacio = StructType([
+                StructField("dev_id", StringType(), True),
+                StructField("name", StringType(), True),
+                StructField("time", TimestampType(), True),
+                StructField("temperature", DoubleType(), True),
+                StructField("humidity", DoubleType(), True),
+            ])
+            return self.queries_mg.spark.createDataFrame([], esquema_vacio)
+
         sensores = self.queries_pg.consultar("""
             SELECT
                 dev_id,
@@ -337,7 +358,6 @@ class Dashboard:
             )
 
         return resultado
-
     def _leer_contaminacion(self):
         """
         Lee mediciones de contaminación desde MongoDB y las relaciona
@@ -430,6 +450,9 @@ class Dashboard:
         if categoria == "accidentes":
             df = self._columna_fecha(df, "start_time")
 
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
+
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
                 .groupBy("dia")
@@ -438,6 +461,9 @@ class Dashboard:
 
         elif categoria in ("temperature", "humidity"):
             df = self._columna_fecha(df, "time")
+
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
 
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
@@ -454,6 +480,9 @@ class Dashboard:
 
             df = self._columna_fecha(df, "datetime_utc")
 
+            if not self._tiene_fechas_validas(df, "fecha"):
+                return pd.DataFrame(columns=["dia", "valor"])
+
             resultado = (
                 df.withColumn("dia", F.to_date("fecha"))
                 .groupBy("dia")
@@ -465,7 +494,6 @@ class Dashboard:
         resultado = resultado.orderBy("dia")
 
         return self._a_pandas(resultado)
-
     # ============================================================
     # VISTA 1: CANTIDAD DE SENSORES POR TIPO
     # ============================================================
@@ -1181,6 +1209,7 @@ class Dashboard:
         )
 
         self.filtros.set_umbral((activar, numero))
+
 
     # ============================================================
     # EJECUCIÓN DEL DASHBOARD
