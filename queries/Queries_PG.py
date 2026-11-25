@@ -130,7 +130,7 @@ class Queries_PG:
         donde = ("WHERE " + " AND ".join(condiciones)) if condiciones else ""
         return self.consultar(
             f"""
-            SELECT fuente, sensor_id, nombre, parametro, unidad, organismo, latitude, longitude
+            SELECT fuente, sensor_id, nombre, parametro, unidad, organismo, zona, latitude, longitude
             FROM sensores_unificados
             {donde}
             ORDER BY fuente, nombre, sensor_id, parametro
@@ -146,12 +146,100 @@ class Queries_PG:
         est = self._txt(estado) if estado else "NULL::text"
         return self.consultar(f"SELECT severity, accidentes FROM accidentes_por_severidad({ini}, {fin}, {est})")
 
+    # ---- Consultas que usan las zonas y las fechas por sensor (db/sensores_zonas.sql) ----
+
+    @classmethod
+    def _rango(cls, fecha_ini: str | None, fecha_fin: str | None) -> tuple[str, str]:
+        """Literales SQL (timestamp) del periodo 'AAAA-MM-DD'. Sin fechas = todo el periodo."""
+        ini = f"{cls._txt(fecha_ini + ' 00:00:00')}::timestamp" if fecha_ini else "'1900-01-01'::timestamp"
+        fin = f"{cls._txt(fecha_fin + ' 23:59:59')}::timestamp" if fecha_fin else "'2999-12-31'::timestamp"
+        return ini, fin
+
+    def sensores_activos_inactivos(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """3. Cantidad de sensores activos e inactivos en el periodo (función estado_sensores)."""
+        ini, fin = self._rango(fecha_ini, fecha_fin)
+        return self.consultar(
+            f"""
+            SELECT fuente, estado, COUNT(1) AS sensores
+            FROM estado_sensores({ini}, {fin})
+            GROUP BY fuente, estado
+            ORDER BY fuente, estado
+            """
+        )
+
+    def sensores_instalados_por_anio(self) -> DataFrame:
+        """6. Sensores instalados por año (año de su primera medición)."""
+        return self.consultar(
+            """
+            SELECT EXTRACT(year FROM fecha_inicio_datos)::int AS anio,
+                   COUNT(DISTINCT (fuente, sensor_id)) AS sensores
+            FROM sensores_unificados
+            WHERE fecha_inicio_datos IS NOT NULL
+            GROUP BY anio
+            ORDER BY anio
+            """
+        )
+
+    def sensores_sin_actividad(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """7. Sensores sin actividad registrada en el periodo (inactivos según estado_sensores)."""
+        ini, fin = self._rango(fecha_ini, fecha_fin)
+        return self.consultar(
+            f"""
+            SELECT fuente, sensor_id, nombre, zona, fecha_inicio_datos, fecha_fin_datos
+            FROM estado_sensores({ini}, {fin})
+            WHERE estado = 'inactivo'
+            ORDER BY fuente, nombre
+            """
+        )
+
+    CRITERIOS_RANKING = ("sensores", "accidentes")
+
+    def ranking_zonas(self, n: int = 10, criterio: str = "sensores", ascendente: bool = False,
+                      fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """8. Ranking de zonas por sensores monitoreados o por accidentes en el periodo.
+        Los sensores de clima cuentan por la zona simulada (ver db/vistas.sql)."""
+        if criterio not in self.CRITERIOS_RANKING:
+            raise ValueError(f"Criterio inválido: {criterio}. Use {self.CRITERIOS_RANKING}")
+        n = int(n)
+        orden = "ASC" if ascendente else "DESC"
+        otro = "accidentes" if criterio == "sensores" else "sensores"
+        ini, fin = self._rango(fecha_ini, fecha_fin)
+        return self.consultar(
+            f"""
+            WITH sens AS (
+                SELECT zona_id, COUNT(DISTINCT (fuente, sensor_id)) AS sensores
+                FROM sensores_unificados
+                WHERE zona_id IS NOT NULL
+                GROUP BY zona_id
+            ), acc AS (
+                SELECT ez.zona_id, COUNT(1) AS accidentes
+                FROM accidents a
+                JOIN cities c ON c.city_id = a.city_id
+                JOIN estados_zona ez ON ez.state_code = c.state_code
+                WHERE a.start_time_utc >= {ini} AND a.start_time_utc <= {fin}
+                GROUP BY ez.zona_id
+            )
+            SELECT z.zona_id, z.nombre AS zona, z.region,
+                   COALESCE(s.sensores, 0) AS sensores,
+                   COALESCE(a.accidentes, 0) AS accidentes
+            FROM zonas z
+            LEFT JOIN sens s ON s.zona_id = z.zona_id
+            LEFT JOIN acc  a ON a.zona_id = z.zona_id
+            ORDER BY {criterio} {orden}, {otro} {orden}, z.nombre
+            LIMIT {n}
+            """
+        )
+
     # Registro de consultas obligatorias: id -> (descripción, método)
     CONSULTAS = {
         1: ("Sensores por tipo", "sensores_por_tipo"),
         2: ("Sensores por ubicación", "sensores_por_ubicacion"),
+        3: ("Sensores activos e inactivos", "sensores_activos_inactivos"),
         4: ("Sensores por organismo responsable", "sensores_por_organismo"),
         5: ("Ubicaciones con mayor cantidad de sensores", "ubicaciones_con_mas_sensores"),
+        6: ("Sensores instalados por año", "sensores_instalados_por_anio"),
+        7: ("Sensores sin actividad registrada", "sensores_sin_actividad"),
+        8: ("Ranking de zonas monitoreadas", "ranking_zonas"),
         9: ("Consulta utilizando una vista", "consulta_con_vista"),
         10: ("Consulta utilizando una función almacenada", "accidentes_por_severidad_fn"),
     }

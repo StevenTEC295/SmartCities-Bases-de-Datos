@@ -22,3 +22,36 @@ AS $$
     GROUP BY a.severity
     ORDER BY a.severity
 $$;
+
+-- Estado de cada sensor (uno por sensor fisico) en el periodo [p_ini, p_fin].
+-- Activo = tiene mediciones en el periodo (su rango de fechas de datos se traslapa con el periodo).
+-- Inactivo = no tiene mediciones en el periodo, o nunca ha tenido (fechas nulas).
+CREATE OR REPLACE FUNCTION estado_sensores(
+    p_ini TIMESTAMP,
+    p_fin TIMESTAMP
+)
+RETURNS TABLE (
+    fuente             TEXT,
+    sensor_id          TEXT,
+    nombre             TEXT,
+    parametros         TEXT,
+    zona               TEXT,
+    fecha_inicio_datos TIMESTAMP,
+    fecha_fin_datos    TIMESTAMP,
+    estado             TEXT
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT v.fuente,
+           v.sensor_id,
+           v.nombre,
+           string_agg(v.parametro, ', ' ORDER BY v.parametro) AS parametros,
+           v.zona,
+           v.fecha_inicio_datos,
+           v.fecha_fin_datos,
+           CASE WHEN v.fecha_inicio_datos <= p_fin AND v.fecha_fin_datos >= p_ini
+                THEN 'activo' ELSE 'inactivo' END AS estado
+    FROM sensores_unificados v
+    GROUP BY v.fuente, v.sensor_id, v.nombre, v.zona, v.fecha_inicio_datos, v.fecha_fin_datos
+    ORDER BY v.fuente, v.nombre, v.sensor_id
+$$;
