@@ -126,6 +126,8 @@ class Dashboard:
             "pg_criterio": "sensores",
             "mg_datos": None,
             "mg_numero": None,
+            "sp_datos": None,
+            "sp_numero": None,
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -1461,6 +1463,170 @@ class Dashboard:
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
     # ============================================================
+    # VISTA 9: CONSULTAS OBLIGATORIAS DE SPARK
+    # ============================================================
+
+    # número -> (columna X, columna Y, tipo de gráfico) de cada gráfico por dataset.
+    # La 3 y la 10 tienen un tratamiento propio (ver mostrar_consultas_spark).
+    SP_EJES = {
+        1: ("nombre", "mediciones", "bar"),
+        2: ("ubicacion", "total_registros", "bar"),
+        5: ("zona", "total_actividad", "bar"),
+        6: ("periodo", "total_registros", "line"),
+        7: ("periodo", "total_registros", "line"),
+        8: ("categoria", "total_registros", "bar"),
+        9: ("anio", "total_registros", "line"),
+    }
+
+    def consultar_spark(self, numero, parametros):
+        """
+        Ejecuta una consulta obligatoria de Spark (Queries_SP.CONSULTAS).
+        `parametros` trae lo elegido en la sección (top n, umbral z); el rango
+        de fechas se toma del panel en el momento de ejecutar.
+        """
+
+        parametros = dict(parametros)
+        inicio, fin = self._rango_fechas()
+        parametros["fecha_ini"] = inicio.strftime("%Y-%m-%d")
+        parametros["fecha_fin"] = fin.strftime("%Y-%m-%d")
+
+        resultado = self.queries.ejecutar(numero, **parametros)
+
+        return self._a_pandas(resultado, self.LIMITE_SERIE)
+
+    def _grafico_por_dataset(self, datos, eje_x, eje_y, tipo):
+        """
+        Un gráfico por dataset (accidentes, contaminación, clima), en columnas.
+        Se separan porque sus magnitudes son muy distintas (millones frente a miles)
+        y en un solo gráfico unos aplastarían a los otros.
+        """
+
+        datasets = list(datos["dataset"].dropna().unique())
+
+        if not datasets:
+            return
+
+        columnas = st.columns(len(datasets))
+
+        for columna, dataset in zip(columnas, datasets):
+            parte = datos[datos["dataset"] == dataset][[eje_x, eje_y]].copy()
+            parte[eje_x] = parte[eje_x].astype(str)
+            parte = parte.set_index(eje_x)
+
+            with columna:
+                st.caption(dataset)
+
+                if tipo == "line":
+                    st.line_chart(parte)
+                else:
+                    st.bar_chart(parte)
+
+    def mostrar_consultas_spark(self):
+        st.subheader("9. Consultas obligatorias de Spark")
+        st.caption("Tecnología: Apache Spark sobre archivos Parquet en HDFS (capa processed).")
+
+        consultas = self.queries.CONSULTAS
+
+        numero = st.selectbox(
+            "Consulta",
+            options=sorted(consultas),
+            format_func=lambda n: f"{n}. {consultas[n][0]}",
+            key="sp_consulta",
+        )
+
+        parametros = {}
+
+        if numero == 1:
+            parametros["n"] = st.number_input(
+                "Cantidad de sensores (top)", min_value=1, max_value=50, value=10, key="sp_n_1"
+            )
+        elif numero in (2, 5):
+            parametros["top_n"] = st.number_input(
+                "Cantidad de resultados (top)", min_value=1, max_value=50, value=15, key=f"sp_n_{numero}"
+            )
+        elif numero == 7:
+            parametros["umbral_z"] = st.number_input(
+                "Umbral del z-score (|z| mayor o igual se marca como anomalía)",
+                min_value=0.5, max_value=5.0, value=1.5, step=0.25, key="sp_umbral_z",
+            )
+
+        try:
+            inicio, fin = self._rango_fechas()
+            st.caption(f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y}).")
+        except ValueError as error:
+            st.warning(str(error))
+
+        if st.button("Ejecutar consulta", key="btn_sp"):
+            actualizado = self._ejecutar_consulta(
+                "sp_datos",
+                lambda: self.consultar_spark(numero, parametros),
+            )
+
+            if actualizado:
+                st.session_state.sp_numero = numero
+
+        datos = st.session_state.sp_datos
+
+        if datos is None:
+            return
+
+        mostrada = st.session_state.sp_numero
+        st.markdown(f"**Resultado de la consulta {mostrada}: {consultas[mostrada][0]}**")
+
+        if datos.empty:
+            st.info("La consulta no devolvió resultados.")
+            return
+
+        if mostrada == 3:
+            # Un indicador por dataset: temperatura (°C), contaminación (valor medio) y severidad.
+            datos = datos.copy()
+            datos["serie"] = datos["dataset"] + " - " + datos["indicador"]
+            serie = datos.pivot_table(index="periodo", columns="serie", values="valor_promedio")
+            st.line_chart(serie)
+
+        elif mostrada == 4:
+            primera = datos.iloc[0]
+            col_1, col_2 = st.columns(2)
+            col_1.metric("Correlación accidentes vs. contaminación", f"{primera['corr_acc_vs_cont']}")
+            col_2.metric("Correlación severidad vs. contaminación", f"{primera['corr_sev_vs_cont']}")
+            st.caption(
+                "Coeficiente de Pearson sobre los meses en común (cerca de 0 = sin relación lineal; "
+                "±1 = relación perfecta). Una correlación no implica causalidad."
+            )
+            col_1, col_2 = st.columns(2)
+            col_1.caption("Accidentes por mes")
+            col_1.line_chart(datos.set_index("periodo")["total_accidentes"])
+            col_2.caption("Contaminación promedio por mes")
+            col_2.line_chart(datos.set_index("periodo")["contaminacion_prom"])
+
+        elif mostrada == 7:
+            anomalias = int((datos["estado"] == "ANOMALIA").sum())
+            st.metric("Meses marcados como anomalía", anomalias)
+
+            if st.checkbox("Mostrar solo anomalías", key="sp_solo_anomalias"):
+                datos = datos[datos["estado"] == "ANOMALIA"]
+
+            self._grafico_por_dataset(datos, "periodo", "total_registros", "line")
+
+        elif mostrada == 10:
+            columnas = st.columns(len(datos))
+
+            for columna, fila in zip(columnas, datos.itertuples()):
+                columna.metric(f"{fila.dataset}: {fila.metrica}".replace("_", " "), f"{fila.valor:,}")
+
+        elif mostrada in self.SP_EJES:
+            eje_x, eje_y, tipo = self.SP_EJES[mostrada]
+            self._grafico_por_dataset(datos, eje_x, eje_y, tipo)
+
+            if mostrada == 2:
+                mapa = datos.dropna(subset=["lat_promedio", "lng_promedio"]).rename(
+                    columns={"lat_promedio": "lat", "lng_promedio": "lon"}
+                )
+                st.map(mapa[["lat", "lon"]])
+
+        st.dataframe(datos, use_container_width=True, hide_index=True)
+
+    # ============================================================
     # ACTUALIZAR TODAS LAS VISTAS
     # ============================================================
 
@@ -1727,3 +1893,7 @@ class Dashboard:
         st.divider()
 
         self.mostrar_consultas_mongodb()
+
+        st.divider()
+
+        self.mostrar_consultas_spark()
