@@ -6,18 +6,82 @@ class Queries_SP:
     """
     Consultas con Spark sobre los archivos Parquet de HDFS (/data/processed).
     Todos los métodos devuelven DataFrames de Spark.
+
+    Fuentes (todas en la capa processed, la misma que se carga a PostgreSQL y MongoDB):
+      accidentes/accidents  -> accidentes (state, city, severity, start_time_utc, ...)
+      contaminacion/{mediciones, sensores, parametros, locations}
+      clima/{mediciones, sensores}
+    Los métodos de periodo aceptan fecha_ini / fecha_fin ('AAAA-MM-DD', UTC); None = sin filtro.
     """
 
-    def __init__(self, spark: SparkSession, ruta: str):
+    # Divisiones del Censo de EE. UU. (misma definición que db/sensores_zonas.sql).
+    ZONAS = {
+        1: "New England", 2: "Mid-Atlantic", 3: "East North Central", 4: "West North Central",
+        5: "South Atlantic", 6: "East South Central", 7: "West South Central", 8: "Mountain", 9: "Pacific",
+    }
+    ESTADOS_ZONA = {
+        **dict.fromkeys(["CT", "ME", "MA", "NH", "RI", "VT"], 1),
+        **dict.fromkeys(["NJ", "NY", "PA"], 2),
+        **dict.fromkeys(["IL", "IN", "MI", "OH", "WI"], 3),
+        **dict.fromkeys(["IA", "KS", "MN", "MO", "NE", "ND", "SD"], 4),
+        **dict.fromkeys(["DE", "DC", "FL", "GA", "MD", "NC", "SC", "VA", "WV"], 5),
+        **dict.fromkeys(["AL", "KY", "MS", "TN"], 6),
+        **dict.fromkeys(["AR", "LA", "OK", "TX"], 7),
+        **dict.fromkeys(["AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY"], 8),
+        **dict.fromkeys(["AK", "CA", "HI", "OR", "WA"], 9),
+    }
+    # Estado y coordenadas de las 4 estaciones de contaminación (las mismas de limpieza.ipynb).
+    # El Parquet de locations solo trae id y nombre.
+    UBICACIONES_CONTAMINACION = [
+        (448, "MA", 42.3295, -71.0826),
+        (626, "NY", 40.816, -73.902),
+        (739, "DC", 38.921847, -77.013178),
+        (2139, "MD", 39.310833, -76.474444),
+    ]
+
+    def __init__(self, spark: SparkSession, ruta: str, ruta_accidentes: str | None = None):
         self.spark = spark
         self.ruta = ruta.rstrip("/")   # ej: hdfs://namenode:9000/data/processed
+        self.ruta_accidentes = (ruta_accidentes or f"{self.ruta}/accidentes/accidents").rstrip("/")
 
     def probar(self) -> None:
         """Comprueba la conexión: imprime los números 0 al 4 (la salida sale en la consola)."""
         self.spark.range(5).show()
 
+    # ---- Utilidades ----
     def _leer(self, subruta: str) -> DataFrame:
         return self.spark.read.parquet(f"{self.ruta}/{subruta}")
+
+    @staticmethod
+    def _periodo(df: DataFrame, columna: str, fecha_ini: str | None, fecha_fin: str | None) -> DataFrame:
+        """Filtra por [fecha_ini, fecha_fin] (días completos). None = sin límite."""
+        if fecha_ini:
+            df = df.filter(F.col(columna) >= F.lit(fecha_ini).cast("timestamp"))
+        if fecha_fin:
+            df = df.filter(F.col(columna) < F.date_add(F.lit(fecha_fin).cast("date"), 1).cast("timestamp"))
+        return df
+
+    def _accidentes(self, fecha_ini=None, fecha_fin=None) -> DataFrame:
+        """Accidentes procesados, filtrados por start_time_utc (igual que PostgreSQL)."""
+        return self._periodo(self.spark.read.parquet(self.ruta_accidentes), "start_time_utc", fecha_ini, fecha_fin)
+
+    def _mediciones_cont(self, fecha_ini=None, fecha_fin=None) -> DataFrame:
+        return self._periodo(self._leer("contaminacion/mediciones"), "datetime_utc", fecha_ini, fecha_fin)
+
+    def _mediciones_clima(self, fecha_ini=None, fecha_fin=None) -> DataFrame:
+        return self._periodo(self._leer("clima/mediciones"), "time", fecha_ini, fecha_fin)
+
+    def _ubicaciones_cont(self) -> DataFrame:
+        """Estaciones de contaminación: location_id, location_name, estado, lat, lng."""
+        coords = self.spark.createDataFrame(
+            self.UBICACIONES_CONTAMINACION, "location_id INT, estado STRING, lat DOUBLE, lng DOUBLE"
+        )
+        return self._leer("contaminacion/locations").join(coords, "location_id", "left")
+
+    def _estado_zona(self) -> DataFrame:
+        """Tabla estado -> zona (zona_id, zona)."""
+        filas = [(estado, zid, self.ZONAS[zid]) for estado, zid in self.ESTADOS_ZONA.items()]
+        return self.spark.createDataFrame(filas, "estado STRING, zona_id INT, zona STRING")
 
     def sensoresTipo(self) -> DataFrame:
         """
@@ -34,13 +98,13 @@ class Queries_SP:
             .agg(F.count("sensor_id").alias("sensores"))
             .orderBy(F.desc("sensores"))
         )
-    # 1. Sensores que generan mas informacion (clima + contaminacion)
-    def sensores_mas_activos(self, n: int = 10) -> DataFrame:
-        clima_med = self._leer("clima/mediciones")
-        clima_sen = self._leer("clima/sensores").select("dev_id", "name")
 
+    # 1. Sensores que generan mas informacion (clima + contaminacion)
+    def sensores_mas_activos(self, n: int = 10, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        clima_sen = self._leer("clima/sensores").select("dev_id", "name")
         clima_activos = (
-            clima_med.filter(F.col("dev_id").isNotNull())
+            self._mediciones_clima(fecha_ini, fecha_fin)
+            .filter(F.col("dev_id").isNotNull())
             .groupBy("dev_id")
             .agg(F.count("*").alias("mediciones"))
             .join(clima_sen, on="dev_id", how="left")
@@ -52,11 +116,15 @@ class Queries_SP:
             )
         )
 
-        cont_med = self._leer("contaminacion/mediciones")
-        cont_sen = self._leer("contaminacion/sensores").select("sensor_id", "location_id")
-
+        cont_sen = (
+            self._leer("contaminacion/sensores")
+            .join(self._leer("contaminacion/locations"), "location_id", "left")
+            .join(self._leer("contaminacion/parametros"), "parameter_id", "left")
+            .select("sensor_id", "location_name", "parameter")
+        )
         cont_activos = (
-            cont_med.filter(F.col("sensor_id").isNotNull())
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .filter(F.col("sensor_id").isNotNull())
             .groupBy("sensor_id")
             .agg(F.count("*").alias("mediciones"))
             .join(cont_sen, on="sensor_id", how="left")
@@ -64,7 +132,7 @@ class Queries_SP:
                 F.lit("contaminacion").alias("dataset"),
                 F.col("sensor_id").cast("string").alias("sensor_id"),
                 F.coalesce(
-                    F.concat(F.lit("Location "), F.col("location_id").cast("string")),
+                    F.concat(F.col("location_name"), F.lit(" ("), F.col("parameter"), F.lit(")")),
                     F.col("sensor_id").cast("string"),
                 ).alias("nombre"),
                 F.col("mediciones"),
@@ -78,36 +146,35 @@ class Queries_SP:
         )
 
     # 2. Distribucion geografica de eventos (accidentes + contaminacion)
-    def distribucion_geografica_eventos(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-        top_n: int = 15,
-    ) -> DataFrame:
-        df_acc = self.spark.read.parquet(ruta_accidentes)
+    def distribucion_geografica_eventos(self, top_n: int = 15, fecha_ini: str | None = None,
+                                        fecha_fin: str | None = None) -> DataFrame:
+        """Eventos = accidentes por ciudad y mediciones de contaminación por estación."""
         acc_geo = (
-            df_acc.filter(F.col("State").isNotNull() & F.col("City").isNotNull())
-            .groupBy("State", "City")
+            self._accidentes(fecha_ini, fecha_fin)
+            .filter(F.col("state").isNotNull() & F.col("city").isNotNull())
+            .groupBy("state", "city")
             .agg(
                 F.count("*").alias("total_registros"),
-                F.round(F.avg(F.col("Start_Lat").cast("double")), 4).alias("lat_promedio"),
-                F.round(F.avg(F.col("Start_Lng").cast("double")), 4).alias("lng_promedio"),
+                F.round(F.avg("start_lat"), 4).alias("lat_promedio"),
+                F.round(F.avg("start_lng"), 4).alias("lng_promedio"),
             )
             .withColumn("dataset", F.lit("accidentes"))
-            .withColumn("ubicacion", F.concat_ws(" - ", F.col("State"), F.col("City")))
+            .withColumn("ubicacion", F.concat_ws(" - ", F.col("state"), F.col("city")))
             .select("dataset", "ubicacion", "total_registros", "lat_promedio", "lng_promedio")
             .orderBy(F.desc("total_registros"))
             .limit(int(top_n))
         )
 
-        cont_sen = self._leer("contaminacion/sensores")
         cont_geo = (
-            cont_sen.filter(F.col("location_id").isNotNull())
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .join(self._leer("contaminacion/sensores").select("sensor_id", "location_id"), "sensor_id")
             .groupBy("location_id")
             .agg(F.count("*").alias("total_registros"))
+            .join(self._ubicaciones_cont(), "location_id", "left")
             .withColumn("dataset", F.lit("contaminacion"))
-            .withColumn("ubicacion", F.concat(F.lit("Location "), F.col("location_id").cast("string")))
-            .withColumn("lat_promedio", F.lit(None).cast("double"))
-            .withColumn("lng_promedio", F.lit(None).cast("double"))
+            .withColumn("ubicacion", F.concat_ws(" - ", F.col("estado"), F.col("location_name")))
+            .withColumn("lat_promedio", F.col("lat"))
+            .withColumn("lng_promedio", F.col("lng"))
             .select("dataset", "ubicacion", "total_registros", "lat_promedio", "lng_promedio")
             .orderBy(F.desc("total_registros"))
             .limit(int(top_n))
@@ -116,13 +183,10 @@ class Queries_SP:
         return acc_geo.unionByName(cont_geo)
 
     # 3. Evolucion temporal de indicadores urbanos (clima + contaminacion + accidentes)
-    def evolucion_temporal_indicadores(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
+    def evolucion_temporal_indicadores(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
         clima_agg = (
-            self._leer("clima/mediciones")
-            .withColumn("periodo", F.date_format(F.col("time").cast("timestamp"), "yyyy-MM"))
+            self._mediciones_clima(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("time"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(
@@ -134,8 +198,8 @@ class Queries_SP:
         )
 
         cont_agg = (
-            self._leer("contaminacion/mediciones")
-            .withColumn("periodo", F.date_format(F.col("datetime_utc").cast("timestamp"), "yyyy-MM"))
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("datetime_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(
@@ -147,15 +211,14 @@ class Queries_SP:
         )
 
         acc_agg = (
-            self.spark.read.parquet(ruta_accidentes)
-            .withColumn("periodo", F.date_format(F.col("Start_Time").cast("timestamp"), "yyyy-MM"))
+            self._accidentes(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("start_time_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(
                 F.count("*").alias("total_registros"),
-                F.round(F.avg(F.col("Severity").cast("double")), 2).alias("severidad_promedio"),
+                F.round(F.avg(F.col("severity").cast("double")), 2).alias("valor_promedio"),
             )
-            .withColumnRenamed("severidad_promedio", "valor_promedio")
             .withColumn("dataset", F.lit("accidentes"))
             .withColumn("indicador", F.lit("severidad_promedio"))
         )
@@ -168,24 +231,23 @@ class Queries_SP:
         )
 
     # 4. Correlacion entre variables (accidentes + contaminacion por periodo)
-    def correlacion_variables(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
+    def correlacion_variables(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """Series mensuales de accidentes y contaminación en los meses en común, más el coeficiente
+        de correlación de Pearson GLOBAL (una sola cifra repetida en cada fila)."""
         acc_mes = (
-            self.spark.read.parquet(ruta_accidentes)
-            .withColumn("periodo", F.date_format(F.col("Start_Time").cast("timestamp"), "yyyy-MM"))
+            self._accidentes(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("start_time_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(
                 F.count("*").cast("double").alias("total_accidentes"),
-                F.round(F.avg(F.col("Severity").cast("double")), 4).alias("severidad_prom_acc"),
+                F.round(F.avg(F.col("severity").cast("double")), 4).alias("severidad_prom_acc"),
             )
         )
 
         cont_mes = (
-            self._leer("contaminacion/mediciones")
-            .withColumn("periodo", F.date_format(F.col("datetime_utc").cast("timestamp"), "yyyy-MM"))
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("datetime_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(
@@ -194,11 +256,13 @@ class Queries_SP:
             )
         )
 
-        w = Window.orderBy("periodo")
+        serie = acc_mes.join(cont_mes, on="periodo", how="inner")
+        globales = serie.agg(
+            F.round(F.corr("total_accidentes", "contaminacion_prom"), 4).alias("corr_acc_vs_cont"),
+            F.round(F.corr("severidad_prom_acc", "contaminacion_prom"), 4).alias("corr_sev_vs_cont"),
+        )
         return (
-            acc_mes.join(cont_mes, on="periodo", how="inner")
-            .withColumn("corr_acc_vs_cont", F.round(F.corr("total_accidentes", "contaminacion_prom").over(w), 4))
-            .withColumn("corr_sev_vs_cont", F.round(F.corr("severidad_prom_acc", "contaminacion_prom").over(w), 4))
+            serie.crossJoin(globales)
             .select(
                 "periodo",
                 "total_accidentes",
@@ -212,36 +276,38 @@ class Queries_SP:
         )
 
     # 5. Ranking de zonas con mayor actividad (accidentes + contaminacion)
-    def ranking_zonas_actividad(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-        top_n: int = 15,
-    ) -> DataFrame:
+    def ranking_zonas_actividad(self, top_n: int = 15, fecha_ini: str | None = None,
+                                fecha_fin: str | None = None) -> DataFrame:
+        """Ranking por zona del Censo (las mismas 9 zonas de PostgreSQL). Actividad = accidentes
+        y mediciones de contaminación. Clima no entra: sus zonas son simuladas (Australia)."""
+        estado_zona = self._estado_zona()
+
         acc_zonas = (
-            self.spark.read.parquet(ruta_accidentes)
-            .filter(F.col("State").isNotNull() & F.col("City").isNotNull())
-            .groupBy("State", "City")
+            self._accidentes(fecha_ini, fecha_fin)
+            .join(estado_zona, F.col("state") == estado_zona["estado"])
+            .groupBy("zona")
             .agg(F.count("*").alias("total_actividad"))
             .withColumn("dataset", F.lit("accidentes"))
-            .withColumn("zona", F.concat_ws(" - ", F.col("State"), F.col("City")))
-            .select("dataset", "zona", "total_actividad")
         )
 
-        cont_med = self._leer("contaminacion/mediciones")
-        cont_sen = self._leer("contaminacion/sensores").select("sensor_id", "location_id")
+        sensor_zona = (
+            self._leer("contaminacion/sensores").select("sensor_id", "location_id")
+            .join(self._ubicaciones_cont().select("location_id", "estado"), "location_id")
+            .join(estado_zona, "estado")
+            .select("sensor_id", "zona")
+        )
         cont_zonas = (
-            cont_med.filter(F.col("sensor_id").isNotNull())
-            .join(cont_sen.filter(F.col("location_id").isNotNull()), on="sensor_id", how="inner")
-            .groupBy("location_id")
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .join(sensor_zona, "sensor_id")
+            .groupBy("zona")
             .agg(F.count("*").alias("total_actividad"))
             .withColumn("dataset", F.lit("contaminacion"))
-            .withColumn("zona", F.concat(F.lit("Location "), F.col("location_id").cast("string")))
-            .select("dataset", "zona", "total_actividad")
         )
 
         w = Window.partitionBy("dataset").orderBy(F.desc("total_actividad"), F.asc("zona"))
         return (
-            acc_zonas.unionByName(cont_zonas)
+            acc_zonas.select("dataset", "zona", "total_actividad")
+            .unionByName(cont_zonas.select("dataset", "zona", "total_actividad"))
             .withColumn("ranking", F.row_number().over(w))
             .filter(F.col("ranking") <= int(top_n))
             .select("dataset", "ranking", "zona", "total_actividad")
@@ -249,13 +315,10 @@ class Queries_SP:
         )
 
     # 6. Tendencias por periodo (accidentes + contaminacion)
-    def tendencias_por_periodo(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
+    def tendencias_por_periodo(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
         acc_mes = (
-            self.spark.read.parquet(ruta_accidentes)
-            .withColumn("periodo", F.date_format(F.col("Start_Time").cast("timestamp"), "yyyy-MM"))
+            self._accidentes(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("start_time_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(F.count("*").alias("total_registros"))
@@ -263,8 +326,8 @@ class Queries_SP:
         )
 
         cont_mes = (
-            self._leer("contaminacion/mediciones")
-            .withColumn("periodo", F.date_format(F.col("datetime_utc").cast("timestamp"), "yyyy-MM"))
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("datetime_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(F.count("*").alias("total_registros"))
@@ -303,14 +366,11 @@ class Queries_SP:
         )
 
     # 7. Deteccion de anomalias (accidentes + contaminacion)
-    def deteccion_anomalias(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-        umbral_z: float = 1.5,
-    ) -> DataFrame:
+    def deteccion_anomalias(self, umbral_z: float = 1.5, fecha_ini: str | None = None,
+                            fecha_fin: str | None = None) -> DataFrame:
         acc_mes = (
-            self.spark.read.parquet(ruta_accidentes)
-            .withColumn("periodo", F.date_format(F.col("Start_Time").cast("timestamp"), "yyyy-MM"))
+            self._accidentes(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("start_time_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(F.count("*").cast("double").alias("total_registros"))
@@ -318,8 +378,8 @@ class Queries_SP:
         )
 
         cont_mes = (
-            self._leer("contaminacion/mediciones")
-            .withColumn("periodo", F.date_format(F.col("datetime_utc").cast("timestamp"), "yyyy-MM"))
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .withColumn("periodo", F.date_format(F.col("datetime_utc"), "yyyy-MM"))
             .filter(F.col("periodo").isNotNull())
             .groupBy("periodo")
             .agg(F.count("*").cast("double").alias("total_registros"))
@@ -345,50 +405,50 @@ class Queries_SP:
         )
 
     # 8. Agrupamiento por categorias (accidentes + contaminacion + clima)
-    def agrupamiento_por_categorias(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
-        df_acc = self.spark.read.parquet(ruta_accidentes).filter(F.col("Severity").isNotNull())
-        total_acc = df_acc.count()
+    def agrupamiento_por_categorias(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """Categorías: severidad (accidentes), sensor (contaminación) y dispositivo (clima).
+        El porcentaje se calcula con una ventana sobre el total (sin un count() extra)."""
+        w = Window.partitionBy()   # todo el conjunto: pocas filas ya agregadas
+
+        def porcentaje():
+            return F.round(F.col("total_registros") * 100.0 / F.sum("total_registros").over(w), 2).alias("porcentaje")
+
         acc_cat = (
-            df_acc.groupBy("Severity")
-            .agg(
+            self._accidentes(fecha_ini, fecha_fin).filter(F.col("severity").isNotNull())
+            .groupBy("severity").agg(F.count("*").alias("total_registros"))
+            .select(
                 F.lit("accidentes").alias("dataset"),
-                F.count("*").alias("total_registros"),
-                F.round((F.count("*").cast("double") / F.lit(float(total_acc))) * 100.0, 2).alias("porcentaje"),
+                F.col("severity").cast("string").alias("categoria"),
+                F.col("total_registros"),
+                porcentaje(),
                 F.lit(None).cast("double").alias("valor_promedio"),
             )
-            .withColumnRenamed("Severity", "categoria")
-            .withColumn("categoria", F.col("categoria").cast("string"))
         )
 
-        df_cont = self._leer("contaminacion/mediciones").filter(F.col("sensor_id").isNotNull())
-        total_cont = df_cont.count()
         cont_cat = (
-            df_cont.groupBy("sensor_id")
-            .agg(
+            self._mediciones_cont(fecha_ini, fecha_fin).filter(F.col("sensor_id").isNotNull())
+            .groupBy("sensor_id")
+            .agg(F.count("*").alias("total_registros"), F.round(F.avg(F.col("value").cast("double")), 2).alias("valor_promedio"))
+            .select(
                 F.lit("contaminacion").alias("dataset"),
-                F.count("*").alias("total_registros"),
-                F.round((F.count("*").cast("double") / F.lit(float(total_cont))) * 100.0, 2).alias("porcentaje"),
-                F.round(F.avg(F.col("value").cast("double")), 2).alias("valor_promedio"),
+                F.col("sensor_id").cast("string").alias("categoria"),
+                F.col("total_registros"),
+                porcentaje(),
+                F.col("valor_promedio"),
             )
-            .withColumnRenamed("sensor_id", "categoria")
-            .withColumn("categoria", F.col("categoria").cast("string"))
         )
 
-        df_clima = self._leer("clima/mediciones").filter(F.col("dev_id").isNotNull())
-        total_clima = df_clima.count()
         clima_cat = (
-            df_clima.groupBy("dev_id")
-            .agg(
+            self._mediciones_clima(fecha_ini, fecha_fin).filter(F.col("dev_id").isNotNull())
+            .groupBy("dev_id")
+            .agg(F.count("*").alias("total_registros"), F.round(F.avg(F.col("temperature").cast("double")), 2).alias("valor_promedio"))
+            .select(
                 F.lit("clima").alias("dataset"),
-                F.count("*").alias("total_registros"),
-                F.round((F.count("*").cast("double") / F.lit(float(total_clima))) * 100.0, 2).alias("porcentaje"),
-                F.round(F.avg(F.col("temperature").cast("double")), 2).alias("valor_promedio"),
+                F.col("dev_id").cast("string").alias("categoria"),
+                F.col("total_registros"),
+                porcentaje(),
+                F.col("valor_promedio"),
             )
-            .withColumnRenamed("dev_id", "categoria")
-            .withColumn("categoria", F.col("categoria").cast("string"))
         )
 
         return (
@@ -399,13 +459,10 @@ class Queries_SP:
         )
 
     # 9. Comparacion historica entre anios (accidentes + contaminacion + clima)
-    def comparacion_historica_anios(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
+    def comparacion_historica_anios(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
         acc_anual = (
-            self.spark.read.parquet(ruta_accidentes)
-            .withColumn("anio", F.year(F.col("Start_Time").cast("timestamp")).cast("int"))
+            self._accidentes(fecha_ini, fecha_fin)
+            .withColumn("anio", F.year(F.col("start_time_utc")).cast("int"))
             .filter(F.col("anio").isNotNull())
             .groupBy("anio")
             .agg(F.count("*").alias("total_registros"))
@@ -413,8 +470,8 @@ class Queries_SP:
         )
 
         cont_anual = (
-            self._leer("contaminacion/mediciones")
-            .withColumn("anio", F.year(F.col("datetime_utc").cast("timestamp")).cast("int"))
+            self._mediciones_cont(fecha_ini, fecha_fin)
+            .withColumn("anio", F.year(F.col("datetime_utc")).cast("int"))
             .filter(F.col("anio").isNotNull())
             .groupBy("anio")
             .agg(F.count("*").alias("total_registros"))
@@ -422,8 +479,8 @@ class Queries_SP:
         )
 
         clima_anual = (
-            self._leer("clima/mediciones")
-            .withColumn("anio", F.year(F.col("time").cast("timestamp")).cast("int"))
+            self._mediciones_clima(fecha_ini, fecha_fin)
+            .withColumn("anio", F.year(F.col("time")).cast("int"))
             .filter(F.col("anio").isNotNull())
             .groupBy("anio")
             .agg(F.count("*").alias("total_registros"))
@@ -448,18 +505,15 @@ class Queries_SP:
         )
 
     # 10. Dashboard analitico o reporte consolidado (accidentes + contaminacion + clima)
-    def dashboard_reporte_consolidado(
-        self,
-        ruta_accidentes: str = "hdfs://namenode:9000/data/staging/accidentes",
-    ) -> DataFrame:
-        total_acc = self.spark.read.parquet(ruta_accidentes).count()
-        total_cont_med = self._leer("contaminacion/mediciones").count()
+    def dashboard_reporte_consolidado(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        total_acc = self._accidentes(fecha_ini, fecha_fin).count()
+        total_cont_med = self._mediciones_cont(fecha_ini, fecha_fin).count()
         total_cont_sen = self._leer("contaminacion/sensores").count()
-        total_clima_med = self._leer("clima/mediciones").count()
+        total_clima_med = self._mediciones_clima(fecha_ini, fecha_fin).count()
         total_clima_sen = self._leer("clima/sensores").count()
 
         filas = [
-            ("accidentes", "eventos_totales", int(total_acc), ruta_accidentes),
+            ("accidentes", "eventos_totales", int(total_acc), self.ruta_accidentes),
             ("contaminacion", "mediciones_totales", int(total_cont_med), f"{self.ruta}/contaminacion/mediciones"),
             ("contaminacion", "sensores_registrados", int(total_cont_sen), f"{self.ruta}/contaminacion/sensores"),
             ("clima", "mediciones_totales", int(total_clima_med), f"{self.ruta}/clima/mediciones"),
@@ -467,3 +521,23 @@ class Queries_SP:
         ]
 
         return self.spark.createDataFrame(filas, ["dataset", "metrica", "valor", "origen"])
+
+    # Registro de consultas obligatorias: id -> (descripción, método)
+    CONSULTAS = {
+        1: ("Sensores que generan más información", "sensores_mas_activos"),
+        2: ("Distribución geográfica de eventos", "distribucion_geografica_eventos"),
+        3: ("Evolución temporal de indicadores urbanos", "evolucion_temporal_indicadores"),
+        4: ("Correlación entre variables", "correlacion_variables"),
+        5: ("Ranking de zonas con mayor actividad", "ranking_zonas_actividad"),
+        6: ("Tendencias por periodo", "tendencias_por_periodo"),
+        7: ("Detección de anomalías", "deteccion_anomalias"),
+        8: ("Agrupamiento por categorías", "agrupamiento_por_categorias"),
+        9: ("Comparación histórica entre años", "comparacion_historica_anios"),
+        10: ("Reporte consolidado", "dashboard_reporte_consolidado"),
+    }
+
+    def ejecutar(self, numero: int, **parametros) -> DataFrame:
+        """Ejecuta una consulta obligatoria por su número (ver CONSULTAS)."""
+        if numero not in self.CONSULTAS:
+            raise ValueError(f"Consulta {numero} no disponible. Disponibles: {sorted(self.CONSULTAS)}")
+        return getattr(self, self.CONSULTAS[numero][1])(**parametros)
