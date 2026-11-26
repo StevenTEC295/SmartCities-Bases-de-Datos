@@ -124,6 +124,8 @@ class Dashboard:
             "pg_datos": None,
             "pg_numero": None,
             "pg_criterio": "sensores",
+            "mg_datos": None,
+            "mg_numero": None,
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -1243,6 +1245,222 @@ class Dashboard:
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
     # ============================================================
+    # VISTA 8: CONSULTAS OBLIGATORIAS DE MONGODB
+    # ============================================================
+
+    MG_VARIABLES = ["temperature", "humidity", "pm25", "pm10", "o3"]
+    MG_VARIABLES_CLIMA = ("temperature", "humidity")
+
+    # número -> (columna de etiqueta, columna de valor, tipo de gráfico). La 3 y la 7 solo llevan tabla.
+    MG_EJES = {
+        1: ("fecha", "valor", "line"),
+        2: ("fecha", "valor", "line"),
+        4: ("etiqueta", "eventos", "bar"),
+        5: ("zona", "alertas", "bar"),
+        6: ("grupo", "promedio", "bar"),
+        8: ("etiqueta", "mediciones", "bar"),
+        9: ("condicion", "accidentes", "bar"),
+        10: ("fecha", "promedio", "line"),
+    }
+
+    def _sensores_mongo(self, variable):
+        """Sensores de la variable elegida: {sensor_id: etiqueta}, para los selectores."""
+
+        try:
+            if "mg_sensores" not in st.session_state:
+                st.session_state.mg_sensores = self._a_pandas(
+                    self.queries_pg.sensores_metadata()
+                )
+
+            meta = st.session_state.mg_sensores
+
+            if variable in self.MG_VARIABLES_CLIMA:
+                filtro = meta["fuente"] == "clima"
+            else:
+                filtro = (meta["fuente"] == "contaminacion") & (meta["parametro"] == variable)
+
+            return {
+                fila.sensor_id: f"{fila.nombre} ({fila.sensor_id})"
+                for fila in meta[filtro].itertuples()
+            }
+
+        except Exception as error:
+            st.error(f"No fue posible leer la lista de sensores: {error}")
+            return {}
+
+    def consultar_mongodb(self, numero, parametros):
+        """
+        Ejecuta una consulta obligatoria de MongoDB (Queries_MG.CONSULTAS).
+        `parametros` trae lo elegido en la sección; el rango de fechas (y, para
+        la 4 y la 5, el límite) se toman del panel en el momento de ejecutar.
+        """
+
+        parametros = dict(parametros)
+
+        if numero != 1:
+            inicio, fin = self._rango_fechas()
+            parametros["fecha_ini"] = inicio.strftime("%Y-%m-%d")
+            parametros["fecha_fin"] = fin.strftime("%Y-%m-%d")
+
+        if numero in (4, 5):
+            superior, limite = self.filtros.get_umbral()
+            parametros["limite"] = limite
+            parametros["superior"] = superior
+
+        resultado = self.queries_mg.ejecutar(
+            numero,
+            sensores=self.queries_pg.sensores_metadata(),
+            **parametros,
+        )
+
+        limite_filas = self.LIMITE_SERIE if numero == 10 else None
+
+        return self._a_pandas(resultado, limite_filas)
+
+    def mostrar_consultas_mongodb(self):
+        st.subheader("8. Consultas obligatorias de MongoDB")
+        st.caption("Tecnología: MongoDB (Aggregation Framework), consultado mediante Spark.")
+
+        consultas = self.queries_mg.CONSULTAS
+
+        numero = st.selectbox(
+            "Consulta",
+            options=sorted(consultas),
+            format_func=lambda n: f"{n}. {consultas[n][0]}",
+            key="mg_consulta",
+        )
+
+        parametros = {}
+
+        if numero in (1, 2, 3, 4, 5, 6, 10):
+            categoria = self.filtros.get_categoria()
+            indice = self.MG_VARIABLES.index(categoria) if categoria in self.MG_VARIABLES else 0
+
+            variable = st.selectbox(
+                "Variable",
+                options=self.MG_VARIABLES,
+                index=indice,
+                key="mg_variable_sel",
+            )
+            parametros["variable"] = variable
+
+            if variable in self.MG_VARIABLES_CLIMA and numero in (5, 6):
+                st.caption("En clima, la zona es una asignación simulada de los dispositivos de Australia.")
+
+            sensores = self._sensores_mongo(variable)
+
+            # Sensor: obligatorio en la 1, opcional en la 2 y la 10, y según el alcance en la 3.
+            if numero == 3:
+                alcance = st.selectbox(
+                    "Alcance",
+                    options=["Cada sensor", "Todos juntos", "Un sensor"],
+                    key="mg_alcance",
+                )
+                parametros["por_sensor"] = alcance == "Cada sensor"
+
+            if numero == 1 or (numero == 3 and alcance == "Un sensor"):
+                if sensores:
+                    parametros["sensor_id"] = st.selectbox(
+                        "Sensor",
+                        options=list(sensores),
+                        format_func=sensores.get,
+                        key=f"mg_sensor_{variable}",
+                    )
+                else:
+                    st.info("No hay sensores para esta variable.")
+
+            elif numero in (2, 10):
+                eleccion = st.selectbox(
+                    "Sensor",
+                    options=["Todos"] + list(sensores),
+                    format_func=lambda s: "Todos" if s == "Todos" else sensores[s],
+                    key=f"mg_sensor_opcional_{variable}",
+                )
+                if eleccion != "Todos":
+                    parametros["sensor_id"] = eleccion
+
+        if numero in (1, 2, 9):
+            parametros["n"] = int(
+                st.number_input(
+                    "Cantidad de filas",
+                    min_value=1,
+                    max_value=500,
+                    value=15 if numero == 9 else 20,
+                    step=1,
+                    key=f"mg_n_{numero}",
+                )
+            )
+
+        if numero == 2 and st.checkbox("Filtrar por rango de valor", key="mg_filtrar_valor"):
+            col_1, col_2 = st.columns(2)
+            parametros["valor_min"] = col_1.number_input("Valor mínimo", value=0.0, key="mg_valor_min")
+            parametros["valor_max"] = col_2.number_input("Valor máximo", value=100.0, key="mg_valor_max")
+
+        if numero == 6:
+            parametros["por"] = st.selectbox(
+                "Agrupar por",
+                options=["zona", "ubicacion"],
+                key="mg_por",
+            )
+
+        if numero == 10:
+            parametros["granularidad"] = st.selectbox(
+                "Granularidad",
+                options=["dia", "mes"],
+                key="mg_granularidad",
+            )
+
+        # Qué toma la consulta del panel
+        if numero != 1:
+            inicio, fin = self._rango_fechas()
+            texto = f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y})"
+
+            if numero in (4, 5):
+                superior, limite = self.filtros.get_umbral()
+                texto += f" y el límite del panel ({'≥' if superior else '≤'} {limite})"
+
+            if numero == 5:
+                texto += ". Las alertas se calculan al vuelo con ese límite; no se guardan"
+
+            st.caption(texto + ".")
+
+        if st.button("Ejecutar consulta", key="btn_mg"):
+            actualizado = self._ejecutar_consulta(
+                "mg_datos",
+                lambda: self.consultar_mongodb(numero, parametros),
+            )
+
+            if actualizado:
+                st.session_state.mg_numero = numero
+
+        datos = st.session_state.mg_datos
+
+        if datos is None:
+            return
+
+        mostrada = st.session_state.mg_numero
+        st.markdown(f"**Resultado de la consulta {mostrada}: {consultas[mostrada][0]}**")
+
+        if datos.empty:
+            st.info("La consulta no devolvió resultados.")
+            return
+
+        if mostrada in self.MG_EJES:
+            etiqueta, valor, tipo = self.MG_EJES[mostrada]
+
+            if etiqueta in datos.columns and valor in datos.columns:
+                grafico = datos[[etiqueta, valor]].copy()
+                grafico[etiqueta] = grafico[etiqueta].astype(str)
+                grafico = grafico.set_index(etiqueta)
+
+                if tipo == "line":
+                    st.line_chart(grafico)
+                else:
+                    st.bar_chart(grafico)
+
+        st.dataframe(datos, use_container_width=True, hide_index=True)
+
+    # ============================================================
     # ACTUALIZAR TODAS LAS VISTAS
     # ============================================================
 
@@ -1505,3 +1723,7 @@ class Dashboard:
         st.divider()
 
         self.mostrar_consultas_postgres()
+
+        st.divider()
+
+        self.mostrar_consultas_mongodb()

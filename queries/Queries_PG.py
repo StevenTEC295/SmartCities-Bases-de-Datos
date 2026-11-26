@@ -230,6 +230,20 @@ class Queries_PG:
             """
         )
 
+    def sensores_metadata(self) -> DataFrame:
+        """Una fila por sensor físico (fuente, sensor_id, nombre, zona, zona_simulada, parametro).
+        `parametro` solo existe en contaminación (en clima cada dispositivo mide varias variables).
+        Lo usa Queries_MG para poner nombre y zona a los resultados de Mongo."""
+        return self.consultar(
+            """
+            SELECT fuente, sensor_id, nombre, zona, zona_simulada,
+                   CASE WHEN fuente = 'contaminacion' THEN MIN(parametro) END AS parametro
+            FROM sensores_unificados
+            GROUP BY fuente, sensor_id, nombre, zona, zona_simulada
+            ORDER BY fuente, nombre, sensor_id
+            """
+        )
+
     # Registro de consultas obligatorias: id -> (descripción, método)
     CONSULTAS = {
         1: ("Sensores por tipo", "sensores_por_tipo"),
