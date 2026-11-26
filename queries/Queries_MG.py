@@ -377,6 +377,94 @@ class Queries_MG:
                      F.sum("mediciones").alias("mediciones"))
                 .orderBy("fecha"))
 
+    # ---------- Consultas de apoyo a los KPIs del dashboard ----------
+
+    # Límites de referencia por contaminante  Una alerta es una lectura que SUPERA el límite.
+    LIMITES_ALERTA = {"pm25": 35.0, "pm10": 150.0, "o3": 0.070}
+
+    # Una condición climática de accidente es "adversa" si contiene alguna de estas palabras
+    # (precipitación, tormenta o visibilidad reducida)
+    CLIMA_ADVERSO = (
+        "Rain", "Drizzle", "Snow", "Sleet", "Freezing", "Ice", "Wintry", "Shower", "Hail",
+        "Thunder", "Storm", "Fog", "Haze", "Mist", "Smoke", "Dust", "Sand", "Ash", "Tornado", "Squall",
+    )
+
+    def kpi_alertas(self, fecha_ini: str | None = None, fecha_fin: str | None = None,
+                    sensores: DataFrame | None = None) -> DataFrame:
+        """Alertas ambientales: lecturas sobre el límite de LIMITES_ALERTA, por contaminante.
+        Devuelve (tipo, unidad, limite, alertas, mediciones); un contaminante sin lecturas no aparece."""
+        partes = []
+        for variable, limite in self.LIMITES_ALERTA.items():
+            coleccion, _, _, c_valor = self._config(variable)
+            pipeline = self._match(variable, self._ids(variable, sensores), fecha_ini, fecha_fin) + [
+                {"$group": {"_id": None,
+                            "alertas": {"$sum": {"$cond": [{"$gt": [f"${c_valor}", limite]}, 1, 0]}},
+                            "mediciones": {"$sum": 1}}},
+                {"$project": {"_id": 0, "alertas": 1, "mediciones": 1}},
+            ]
+            df = self.agregar(coleccion, pipeline)
+            if "alertas" not in df.columns:
+                continue
+            total = df.agg(F.sum("alertas").alias("alertas"), F.sum("mediciones").alias("mediciones"))
+            partes.append(total.select(
+                F.lit(variable).alias("tipo"), F.lit(self.UNIDADES[variable]).alias("unidad"),
+                F.lit(limite).alias("limite"),
+                F.col("alertas").cast("long").alias("alertas"), F.col("mediciones").cast("long").alias("mediciones"),
+            ))
+        if not partes:
+            return self.spark.range(0)
+        resultado = partes[0]
+        for parte in partes[1:]:
+            resultado = resultado.unionByName(parte)
+        return resultado
+
+    def kpi_ritmo_datos(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """Ritmo de recepción por fuente (contaminación y clima): mediciones por día y por hora,
+        calculados solo sobre los días/horas CON datos (no sobre todo el periodo, que diluiría el ritmo).
+        Devuelve (fuente, mediciones, dias_con_datos, horas_con_datos, por_dia, por_hora)."""
+        partes = []
+        for fuente, variable in (("contaminacion", "pm25"), ("clima", "temperature")):
+            # ids=None: toda la colección de esa fuente (solo se filtra por fechas)
+            coleccion, _, campo_fecha, _ = self._config(variable)
+            pipeline = self._match(variable, None, fecha_ini, fecha_fin) + [
+                {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d %H", "date": f"${campo_fecha}"}},
+                            "n": {"$sum": 1}}},
+                {"$project": {"_id": 0, "hora": "$_id", "n": 1}},
+            ]
+            df = self.agregar(coleccion, pipeline)
+            if "hora" not in df.columns:
+                continue
+            # Se vuelve a sumar por hora: el conector puede repetir la misma hora en varias particiones
+            horas = df.groupBy("hora").agg(F.sum("n").alias("n"))
+            resumen = horas.agg(
+                F.sum("n").cast("long").alias("mediciones"),
+                F.count(F.lit(1)).cast("long").alias("horas_con_datos"),
+                F.countDistinct(F.substring("hora", 1, 10)).cast("long").alias("dias_con_datos"),
+            )
+            partes.append(resumen.select(
+                F.lit(fuente).alias("fuente"), "mediciones", "dias_con_datos", "horas_con_datos",
+                F.round(F.col("mediciones") / F.col("dias_con_datos"), 2).alias("por_dia"),
+                F.round(F.col("mediciones") / F.col("horas_con_datos"), 2).alias("por_hora"),
+            ))
+        if not partes:
+            return self.spark.range(0)
+        resultado = partes[0]
+        for parte in partes[1:]:
+            resultado = resultado.unionByName(parte)
+        return resultado
+
+    def kpi_clima_adverso(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """% de accidentes con clima adverso (ver CLIMA_ADVERSO). Reutiliza accidentes_por_condicion
+        y clasifica cada condición en Spark. Devuelve (accidentes, adversos, porcentaje)."""
+        condiciones = self.accidentes_por_condicion(fecha_ini, fecha_fin, n=1000)
+        if "condicion" not in condiciones.columns:
+            return condiciones
+        adversa = F.col("condicion").rlike("|".join(self.CLIMA_ADVERSO))
+        return (condiciones.agg(
+                    F.sum("accidentes").cast("long").alias("accidentes"),
+                    F.sum(F.when(adversa, F.col("accidentes")).otherwise(0)).cast("long").alias("adversos"))
+                .withColumn("porcentaje", F.round(F.col("adversos") * 100.0 / F.col("accidentes"), 2)))
+
     # Registro de consultas obligatorias: número -> (descripción, método)
     CONSULTAS = {
         1: ("Lecturas de un sensor específico", "lecturas_sensor"),

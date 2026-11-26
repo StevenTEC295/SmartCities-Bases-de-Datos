@@ -7,6 +7,9 @@ from datetime import datetime
 
 from pyspark.sql import DataFrame, SparkSession, functions as F
 from pyspark.sql.types import LongType, StringType, StructField, StructType, TimestampType
+from pyspark.sql.window import Window
+
+from .Queries_SP import Queries_SP   # reutiliza el mapeo estado -> zona y las estaciones de contaminación
 
 
 class Queries_HDFS:
@@ -68,9 +71,12 @@ class Queries_HDFS:
         carpeta_salida: str = "/tmp/dashboard_mr",
         timeout: int = 60,
         timeout_job: int = 900,
+        ruta_texto: str | None = None,
     ):
         self.spark = spark
         self.base_uri = base_uri.rstrip("/")     # carpeta de tus datos en HDFS
+        # Texto limpio (CSV sin encabezado) que lee MapReduce; se genera con preparar_texto()
+        self.ruta_texto = (ruta_texto or self.base_uri.rsplit("/", 1)[0] + "/mapreduce").rstrip("/")
         self.comando = shlex.split(comando)
         self.comando_hadoop = shlex.split(comando_hadoop)
         self.jar_streaming = jar_streaming
@@ -308,3 +314,305 @@ class Queries_HDFS:
             return ["wordcount", self._resolver(ruta), salida]
         df = self._texto_a_df(self._correr_job(self.jar_ejemplos, args), ["palabra", "conteo"])
         return df.withColumn("conteo", F.col("conteo").cast("long")).orderBy(F.col("conteo").desc()).limit(int(top))
+
+    # =====================================================================
+    #  Operaciones de HDFS para la demostración (-cat, -get, -rm, fsck, report)
+    # =====================================================================
+    def _comando_hdfs(self, *args: str) -> list[str]:
+        """Arma `hdfs <args>` (p. ej. fsck, dfsadmin) usando el mismo prefijo que `hdfs dfs`."""
+        base = self.comando[:-1] if self.comando and self.comando[-1] == "dfs" else self.comando
+        return [*base, *args]
+
+    def leer_archivo(self, ruta: str, lineas: int = 10) -> DataFrame:
+        """`hdfs dfs -cat <ruta>`: primeras `lineas` líneas (no descarga el archivo completo)."""
+        proceso = subprocess.Popen(
+            [*self.comando, "-cat", self._resolver(ruta)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
+        )
+        filas = []
+        try:
+            for linea in proceso.stdout:
+                filas.append((linea.rstrip("\n"),))
+                if len(filas) >= int(lineas):
+                    break
+        finally:
+            proceso.kill()
+        return self.spark.createDataFrame(filas, StructType([StructField("linea", StringType())]))
+
+    def descargar(self, ruta_hdfs: str, destino_local: str) -> None:
+        """`hdfs dfs -get <ruta_hdfs> <destino_local>` (destino = ruta vista por el comando, p. ej. dentro del contenedor)."""
+        self._ejecutar("-get", "-f", self._resolver(ruta_hdfs), self._validar_local(destino_local))
+
+    def eliminar(self, ruta: str, recursivo: bool = False) -> None:
+        """`hdfs dfs -rm [-r] <ruta>`. Úsalo solo sobre carpetas de prueba."""
+        ruta = self._resolver(ruta)
+        if ruta.rstrip("/").endswith("/data") or ruta.rstrip("/") in ("", "/", "hdfs://namenode:9000"):
+            raise ValueError("No se permite borrar la carpeta raíz de los datos")
+        self._ejecutar("-rm", *(["-r"] if recursivo else []), ruta)
+
+    def bloques(self, ruta: str) -> DataFrame:
+        """`hdfs fsck <ruta> -files -blocks -locations`: un renglón por bloque, con el/los datanodes que lo guardan."""
+        r = subprocess.run(
+            self._comando_hdfs("fsck", self._resolver(ruta), "-files", "-blocks", "-locations"),
+            capture_output=True, text=True, timeout=self.timeout_job,
+        )
+        patron = re.compile(r"^(\d+)\. \S+:(blk_\d+)_\d+ len=(\d+) Live_repl=(\d+)\s+\[(.*)\]")
+        filas = []
+        for linea in r.stdout.splitlines():
+            m = patron.match(linea.strip())
+            if m:
+                nodos = ", ".join(sorted(set(re.findall(r"DatanodeInfoWithStorage\[([\d.]+:\d+)", m.group(5)))))
+                filas.append((int(m.group(1)), m.group(2), int(m.group(3)), int(m.group(4)), nodos))
+        esquema = "orden INT, bloque STRING, tamano_bytes LONG, replicas_vivas INT, datanodes STRING"
+        return self.spark.createDataFrame(filas, esquema)
+
+    def resumen_cluster(self) -> DataFrame:
+        """Estado del clúster (`hdfs dfsadmin -report` y `fsck`): datanodes vivos, bloques, replicación."""
+        r = subprocess.run(self._comando_hdfs("dfsadmin", "-report"), capture_output=True, text=True, timeout=self.timeout)
+        buscar = {
+            "Datanodes vivos": r"Live datanodes \((\d+)\)",
+            "Capacidad configurada": r"Configured Capacity: \d+ \(([^)]+)\)",
+            "Espacio usado": r"DFS Used: \d+ \(([^)]+)\)",
+            "Bloques sub-replicados": r"Under replicated blocks: (\d+)",
+            "Bloques corruptos": r"Blocks with corrupt replicas: (\d+)",
+            "Bloques perdidos": r"Missing blocks: (\d+)",
+        }
+        filas = []
+        for nombre, patron in buscar.items():
+            m = re.search(patron, r.stdout)
+            filas.append((nombre, m.group(1) if m else None))
+        return self.spark.createDataFrame(filas, "metrica STRING, valor STRING")
+
+    # =====================================================================
+    #  Consultas obligatorias de Hadoop (MapReduce sobre el texto limpio)
+    # =====================================================================
+    # Texto limpio generado desde los Parquet de processed (CSV sin encabezado, posición de columnas):
+    TEXTO = {
+        "contaminacion": "contaminacion",   # 1 sensor_id, 2 fecha_utc, 3 valor, 4 zona
+        "clima": "clima",                   # 1 dev_id, 2 fecha_utc, 3 temperatura (°C)
+        "accidentes": "accidentes",         # 1 estado, 2 zona, 3 fecha_utc, 4 severidad
+    }
+    _FECHA = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+    _REDUCER_RESUMEN = (
+        r"""awk 'BEGIN{FS="\t"} """
+        r"""$2 ~ /^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$/ { """
+        r"""s[$1]+=$2; c[$1]++; """
+        r"""if (!($1 in mn) || $2+0 < mn[$1]) mn[$1]=$2+0; """
+        r"""if (!($1 in mx) || $2+0 > mx[$1]) mx[$1]=$2+0 } """
+        r"""END { for (k in s) printf "%s\t%d\t%.4f\t%.4f\t%.4f\n", k, c[k], s[k]/c[k], mn[k], mx[k] }'"""
+    )
+
+    def preparar_texto(self) -> DataFrame:
+        """
+        Genera el texto limpio que lee MapReduce a partir de los Parquet de la capa processed.
+        MapReduce (Hadoop Streaming) no lee Parquet, y así sus resultados salen de los mismos
+        datos limpios que usan PostgreSQL y MongoDB. Se puede repetir sin problema (sobrescribe).
+        Devuelve un DataFrame con las filas escritas por dataset.
+        """
+        sp = Queries_SP(self.spark, self.base_uri)
+        zonas = sp._estado_zona().select("estado", "zona")
+        sin_zona = F.coalesce(F.col("zona"), F.lit("Sin zona"))
+
+        sensor_zona = (
+            sp._leer("contaminacion/sensores").select("sensor_id", "location_id")
+            .join(sp._ubicaciones_cont().select("location_id", "estado"), "location_id", "left")
+            .join(zonas, "estado", "left")
+            .select("sensor_id", sin_zona.alias("zona"))
+        )
+        contaminacion = (
+            sp._leer("contaminacion/mediciones").join(sensor_zona, "sensor_id", "left")
+            .select(
+                F.col("sensor_id").cast("string"),
+                F.date_format("datetime_utc", "yyyy-MM-dd HH:mm:ss"),
+                F.col("value").cast("double"),
+                F.coalesce(F.col("zona"), F.lit("Sin zona")),
+            )
+        )
+        clima = (
+            sp._leer("clima/mediciones")
+            .select(
+                F.col("dev_id").cast("string"),
+                F.date_format("time", "yyyy-MM-dd HH:mm:ss"),
+                F.col("temperature").cast("double"),
+            )
+        )
+        accidentes = (
+            self.spark.read.parquet(sp.ruta_accidentes)
+            .join(zonas, F.col("state") == zonas["estado"], "left")
+            .select(
+                F.col("state"),
+                sin_zona,
+                F.date_format("start_time_utc", "yyyy-MM-dd HH:mm:ss"),
+                F.col("severity").cast("int"),
+            )
+        )
+
+        conteos = []
+        for nombre, df in (("contaminacion", contaminacion), ("clima", clima), ("accidentes", accidentes)):
+            destino = f"{self.ruta_texto}/{self.TEXTO[nombre]}"
+            df.write.mode("overwrite").option("header", False).option("sep", ",").csv(destino)
+            # Una sola réplica: el clúster tiene un único datanode (evita bloques sub-replicados)
+            try:
+                self._ejecutar("-setrep", "-R", "1", destino)
+            except RuntimeError:
+                pass
+            conteos.append((nombre, self.spark.read.csv(destino).count(), destino))
+        return self.spark.createDataFrame(conteos, "dataset STRING, filas LONG, ruta STRING")
+
+    def texto_listo(self) -> bool:
+        """True si ya existe el texto limpio de los tres datasets."""
+        return all(self.existe(f"{self.ruta_texto}/{n}") for n in self.TEXTO.values())
+
+    def _resumen(self, dataset: str, col_clave: int, col_valor: int, col_fecha: int | None = None,
+                 fecha_ini: str | None = None, fecha_fin: str | None = None,
+                 etiqueta_total: str | None = None) -> DataFrame:
+        """
+        Job MapReduce: por cada clave calcula cantidad, promedio, mínimo y máximo del valor.
+        fecha_ini y fecha_fin ('AAAA-MM-DD') filtran en el mapper por la columna `col_fecha` (días completos).
+        Con `etiqueta_total` agrega además una clave que resume todo el dataset.
+        Devuelve (clave, mediciones, promedio, minimo, maximo).
+        """
+        condiciones = []
+        for fecha, operador, hora in ((fecha_ini, ">=", "00:00:00"), (fecha_fin, "<=", "23:59:59")):
+            if fecha:
+                if not self._FECHA.match(fecha):
+                    raise ValueError(f"Fecha inválida: {fecha!r} (use AAAA-MM-DD)")
+                condiciones.append(f'${col_fecha} {operador} "{fecha} {hora}"')
+        if etiqueta_total is not None and not self._TEXTO_SEGURO.match(etiqueta_total):
+            raise ValueError(f"Etiqueta inválida: {etiqueta_total!r}")
+
+        accion = f'print ${col_clave} "\\t" ${col_valor}'
+        if etiqueta_total:
+            accion += f'; print "{etiqueta_total}" "\\t" ${col_valor}'
+        mapper = f"awk -F, '{' && '.join(condiciones)} {{{accion}}}'"
+
+        df = self.ejecutar_streaming(
+            f"{self.ruta_texto}/{self.TEXTO[dataset]}", mapper, self._REDUCER_RESUMEN,
+            columnas=("clave", "mediciones", "promedio", "minimo", "maximo"),
+        )
+        return (
+            df.withColumn("mediciones", F.col("mediciones").cast("long"))
+              .withColumn("promedio", F.col("promedio").cast("double"))
+              .withColumn("minimo", F.col("minimo").cast("double"))
+              .withColumn("maximo", F.col("maximo").cast("double"))
+        )
+
+    def _nombres_sensores(self) -> DataFrame:
+        """fuente, sensor_id (texto), nombre y variable de cada sensor (de los Parquet de processed)."""
+        sp = Queries_SP(self.spark, self.base_uri)
+        cont = (
+            sp._leer("contaminacion/sensores")
+            .join(sp._leer("contaminacion/locations"), "location_id", "left")
+            .join(sp._leer("contaminacion/parametros"), "parameter_id", "left")
+            .select(
+                F.lit("contaminacion").alias("fuente"),
+                F.col("sensor_id").cast("string").alias("sensor_id"),
+                F.col("location_name").alias("nombre"),
+                F.col("parameter").alias("variable"),
+            )
+        )
+        clima = sp._leer("clima/sensores").select(
+            F.lit("clima").alias("fuente"),
+            F.col("dev_id").cast("string").alias("sensor_id"),
+            F.col("name").alias("nombre"),
+            F.lit("temperature").alias("variable"),
+        )
+        return cont.unionByName(clima)
+
+    def _por_sensor(self, fuente: str | None, fecha_ini: str | None, fecha_fin: str | None) -> DataFrame:
+        """Resumen por sensor (contaminación y/o clima) con nombre y variable. Base de las preguntas 1, 2 y 5."""
+        partes = []
+        for nombre in ("contaminacion", "clima"):
+            if fuente in (None, nombre):
+                partes.append(
+                    self._resumen(nombre, 1, 3, 2, fecha_ini, fecha_fin)
+                    .withColumn("fuente", F.lit(nombre))
+                    .withColumnRenamed("clave", "sensor_id")
+                )
+        if not partes:
+            raise ValueError("fuente debe ser 'contaminacion', 'clima' o None")
+        union = partes[0] if len(partes) == 1 else partes[0].unionByName(partes[1])
+        return union.join(self._nombres_sensores(), ["fuente", "sensor_id"], "left")
+
+    # 1. ¿Cuántas mediciones existen por sensor?
+    def mediciones_por_sensor(self, fuente: str | None = None, fecha_ini: str | None = None,
+                              fecha_fin: str | None = None) -> DataFrame:
+        return (
+            self._por_sensor(fuente, fecha_ini, fecha_fin)
+            .select("fuente", "sensor_id", "nombre", "variable", "mediciones")
+            .orderBy(F.desc("mediciones"), F.asc("sensor_id"))
+        )
+
+    # 2. ¿Cuál sensor produjo mayor cantidad de datos?
+    def sensor_con_mas_datos(self, n: int = 5, fuente: str | None = None, fecha_ini: str | None = None,
+                             fecha_fin: str | None = None) -> DataFrame:
+        todos = self.mediciones_por_sensor(fuente, fecha_ini, fecha_fin)
+        total = Window.partitionBy()
+        return (
+            todos.withColumn("porcentaje_del_total", F.round(F.col("mediciones") * 100.0 / F.sum("mediciones").over(total), 2))
+            .limit(int(n))
+        )
+
+    # 3. ¿Cuál es la temperatura promedio histórica? (clima, grados Celsius)
+    def temperatura_promedio_historica(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """Promedio de la temperatura en °C: primero el global (sensor 'TODOS') y luego por dispositivo."""
+        df = self._resumen("clima", 1, 3, 2, fecha_ini, fecha_fin, etiqueta_total="TODOS")
+        nombres = self._nombres_sensores().filter(F.col("fuente") == "clima").select(
+            F.col("sensor_id").alias("clave"), "nombre"
+        )
+        return (
+            df.join(nombres, "clave", "left")
+            .select(
+                F.col("clave").alias("sensor_id"),
+                F.coalesce(F.col("nombre"), F.when(F.col("clave") == "TODOS", F.lit("Todos los sensores"))).alias("nombre"),
+                "mediciones",
+                F.round("promedio", 2).alias("promedio_c"),
+                F.round("minimo", 2).alias("minimo_c"),
+                F.round("maximo", 2).alias("maximo_c"),
+            )
+            .orderBy((F.col("sensor_id") != "TODOS"), F.desc("promedio_c"))
+        )
+
+    # 4. ¿Cuál es la cantidad de eventos por zona?
+    def eventos_por_zona(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
+        """Eventos = accidentes (zona del estado) y mediciones de contaminación (zona de la estación)."""
+        acc = (
+            self._resumen("accidentes", 2, 4, 3, fecha_ini, fecha_fin)
+            .select(F.lit("accidentes").alias("dataset"), F.col("clave").alias("zona"), F.col("mediciones").alias("eventos"))
+        )
+        cont = (
+            self._resumen("contaminacion", 4, 3, 2, fecha_ini, fecha_fin)
+            .select(F.lit("contaminacion").alias("dataset"), F.col("clave").alias("zona"), F.col("mediciones").alias("eventos"))
+        )
+        return acc.unionByName(cont).orderBy(F.asc("dataset"), F.desc("eventos"))
+
+    # 5. ¿Cuál es el comportamiento de los sensores durante un período determinado?
+    def comportamiento_sensores(self, fecha_ini: str | None = None, fecha_fin: str | None = None,
+                                fuente: str | None = None) -> DataFrame:
+        """Por sensor en el periodo: cantidad de mediciones, promedio, mínimo y máximo."""
+        return (
+            self._por_sensor(fuente, fecha_ini, fecha_fin)
+            .select(
+                "fuente", "sensor_id", "nombre", "variable", "mediciones",
+                F.round("promedio", 2).alias("promedio"),
+                F.round("minimo", 2).alias("minimo"),
+                F.round("maximo", 2).alias("maximo"),
+            )
+            .orderBy(F.asc("fuente"), F.desc("mediciones"))
+        )
+
+    # Registro de preguntas: id -> (descripción, método)
+    CONSULTAS = {
+        1: ("Mediciones por sensor", "mediciones_por_sensor"),
+        2: ("Sensor que produjo mayor cantidad de datos", "sensor_con_mas_datos"),
+        3: ("Temperatura promedio histórica (°C)", "temperatura_promedio_historica"),
+        4: ("Cantidad de eventos por zona", "eventos_por_zona"),
+        5: ("Comportamiento de los sensores en un periodo", "comportamiento_sensores"),
+    }
+
+    def ejecutar(self, numero: int, **parametros) -> DataFrame:
+        """Ejecuta una pregunta de Hadoop por su número (ver CONSULTAS)."""
+        if numero not in self.CONSULTAS:
+            raise ValueError(f"Consulta {numero} no disponible. Disponibles: {sorted(self.CONSULTAS)}")
+        return getattr(self, self.CONSULTAS[numero][1])(**parametros)

@@ -128,6 +128,11 @@ class Dashboard:
             "mg_numero": None,
             "sp_datos": None,
             "sp_numero": None,
+            "kpi_datos": None,
+            "hd_datos": None,
+            "hd_numero": None,
+            "hd_op": None,
+            "hd_bloques": None,
             "error_vista_1": None,
             "error_vista_2": None,
             "error_tendencia_1": None,
@@ -1090,6 +1095,242 @@ class Dashboard:
                 )
 
     # ============================================================
+    # KPIs (MÉTRICAS CLAVE): AMBIENTE E IoT
+    # ============================================================
+
+    KPI_SIN_DATOS = "Sin datos"
+
+    @staticmethod
+    def _kpi_seguro(funcion):
+        """Ejecuta el cálculo de un KPI; si falla devuelve el mensaje (str) y las demás tarjetas siguen."""
+        try:
+            return funcion()
+        except Exception as error:
+            return f"{type(error).__name__}: {error}"[:300]
+
+    def consultar_kpis(self):
+        """
+        Calcula los datos de todos los KPIs con el rango de fechas del panel.
+        Cada fuente va por separado: si una falla, su valor es un texto de error y el resto se conserva.
+        """
+
+        inicio, fin = self._rango_fechas()
+        fecha_ini = inicio.strftime("%Y-%m-%d")
+        fecha_fin = fin.strftime("%Y-%m-%d")
+
+        sensores = self.queries_pg.sensores_metadata()
+        mg = self.queries_mg
+
+        return {
+            # Promedios por tipo de sensor (temperatura, humedad, PM2.5, O3) y mediciones recibidas
+            "promedios": self._kpi_seguro(lambda: self._a_pandas(
+                mg.promedio_por_tipo_sensor(fecha_ini, fecha_fin, sensores))),
+            # Alertas ambientales = lecturas sobre el límite de referencia de cada contaminante
+            "alertas": self._kpi_seguro(lambda: self._a_pandas(mg.kpi_alertas(fecha_ini, fecha_fin, sensores))),
+            # Datos por día y por hora (sobre días/horas con datos)
+            "ritmo": self._kpi_seguro(lambda: self._a_pandas(mg.kpi_ritmo_datos(fecha_ini, fecha_fin))),
+            # % de accidentes con clima adverso
+            "clima_adverso": self._kpi_seguro(lambda: self._a_pandas(mg.kpi_clima_adverso(fecha_ini, fecha_fin))),
+            # Sensores totales y activos/inactivos (PostgreSQL)
+            "sensores": self._kpi_seguro(lambda: self._a_pandas(
+                self.queries_pg.sensores_activos_inactivos(fecha_ini, fecha_fin))),
+        }
+
+    @staticmethod
+    def _kpi_tiene(datos, *columnas):
+        """True si `datos` es un DataFrame con filas y todas las columnas pedidas (un resultado vacío de
+        Spark llega sin columnas)."""
+        return not isinstance(datos, str) and datos is not None and not datos.empty \
+            and all(columna in datos.columns for columna in columnas)
+
+    def _tarjeta_kpi(self, columna, titulo, valor, ayuda, nota=None):
+        """Dibuja una tarjeta: valor grande, ayuda con la fórmula y una nota opcional debajo."""
+        with columna:
+            st.metric(titulo, valor, help=ayuda)
+
+            if nota:
+                st.caption(nota)
+
+    def _kpi_promedio(self, datos, tipo, unidad, decimales):
+        """(valor, nota) del promedio de un tipo de sensor, o el aviso de error / sin datos."""
+        promedios = datos["promedios"]
+
+        if isinstance(promedios, str):
+            return "Error", promedios
+
+        if not self._kpi_tiene(promedios, "tipo", "promedio", "mediciones"):
+            return self.KPI_SIN_DATOS, "No hay mediciones en el periodo."
+
+        fila = promedios[promedios["tipo"] == tipo]
+
+        if fila.empty:
+            return self.KPI_SIN_DATOS, "No hay mediciones en el periodo."
+
+        fila = fila.iloc[0]
+        return f"{fila['promedio']:.{decimales}f} {unidad}", f"{int(fila['mediciones']):,} mediciones"
+
+    def mostrar_kpis(self):
+        st.subheader("Indicadores clave (KPIs)")
+        st.caption(
+            "Todos usan el rango de fechas del panel. Se calculan solo al presionar «Actualizar KPIs» "
+            "(consultan MongoDB y PostgreSQL mediante Spark)."
+        )
+
+        if st.button("Actualizar KPIs", key="btn_kpis"):
+            with st.spinner("Calculando KPIs..."):
+                self._ejecutar_consulta("kpi_datos", self.consultar_kpis)
+
+        datos = st.session_state.kpi_datos
+
+        if datos is None:
+            st.info("Presione «Actualizar KPIs» para calcular los indicadores.")
+            return
+
+        # ---------------- Ambiente ----------------
+        st.markdown("**Ambiente**")
+        col_1, col_2, col_3 = st.columns(3)
+
+        valor, nota = self._kpi_promedio(datos, "temperature", "°C", 2)
+        self._tarjeta_kpi(col_1, "Temperatura global promedio", valor,
+                          "Promedio de todas las lecturas de temperatura de los dispositivos de clima. "
+                          "Fuente: MongoDB (promedio por tipo de sensor).", nota)
+
+        valor, nota = self._kpi_promedio(datos, "pm25", "µg/m³", 2)
+        self._tarjeta_kpi(col_2, "PM2.5 promedio", valor,
+                          "Promedio de las lecturas de los sensores de PM2.5. Fuente: MongoDB.", nota)
+
+        valor, nota = self._kpi_promedio(datos, "o3", "ppm", 3)
+        self._tarjeta_kpi(col_3, "O₃ promedio", valor,
+                          "Promedio de las lecturas de los sensores de ozono (O₃). El dataset no tiene CO₂, "
+                          "por eso se usa O₃. Fuente: MongoDB.", nota)
+
+        col_4, col_5, col_6 = st.columns(3)
+
+        valor, nota = self._kpi_promedio(datos, "humidity", "%", 1)
+        self._tarjeta_kpi(col_4, "Humedad promedio", valor,
+                          "Promedio de las lecturas de humedad de los dispositivos de clima. Fuente: MongoDB.", nota)
+
+        alertas = datos["alertas"]
+        limites = ", ".join(f"{k} > {v}" for k, v in self.queries_mg.LIMITES_ALERTA.items())
+        ayuda_alertas = (
+            "Lecturas que superan el límite de referencia de cada contaminante "
+            f"({limites}). Son valores indicativos: se comparan contra lecturas por hora, no contra "
+            "promedios de 24 horas. Fuente: MongoDB."
+        )
+
+        if isinstance(alertas, str):
+            valor_alertas, nota_alertas = "Error", alertas
+        elif self._kpi_tiene(alertas, "tipo", "alertas"):
+            valor_alertas = f"{int(alertas['alertas'].sum()):,}"
+            nota_alertas = " · ".join(f"{f.tipo}: {int(f.alertas):,}" for f in alertas.itertuples())
+        else:
+            valor_alertas, nota_alertas = self.KPI_SIN_DATOS, "No hay mediciones en el periodo."
+
+        self._tarjeta_kpi(col_5, "Alertas ambientales", valor_alertas, ayuda_alertas, nota_alertas)
+
+        adverso = datos["clima_adverso"]
+        ayuda_adverso = (
+            "Accidentes cuya condición climática es adversa (lluvia, llovizna, nieve, hielo, tormenta, "
+            "niebla, bruma, humo o polvo) entre todos los accidentes del periodo. No cuentan nublado, "
+            "«Fair» ni solo viento. El periodo se filtra por la hora del clima. Fuente: MongoDB."
+        )
+
+        if isinstance(adverso, str):
+            valor_adverso, nota_adverso = "Error", adverso
+        elif self._kpi_tiene(adverso, "accidentes", "adversos", "porcentaje") and int(adverso.iloc[0]["accidentes"] or 0) > 0:
+            fila = adverso.iloc[0]
+            valor_adverso = f"{fila['porcentaje']:.2f} %"
+            nota_adverso = f"{int(fila['adversos']):,} de {int(fila['accidentes']):,} accidentes"
+        else:
+            valor_adverso = self.KPI_SIN_DATOS
+            nota_adverso = "No hay accidentes en el periodo (los datos llegan hasta marzo de 2023)."
+
+        self._tarjeta_kpi(col_6, "% accidentes con clima adverso", valor_adverso, ayuda_adverso, nota_adverso)
+
+        # ---------------- IoT ----------------
+        st.markdown("**IoT**")
+        col_1, col_2, col_3 = st.columns(3)
+
+        sensores = datos["sensores"]
+
+        if isinstance(sensores, str):
+            valor_total = valor_estado = "Error"
+            nota_total = nota_estado = sensores
+        elif self._kpi_tiene(sensores, "fuente", "estado", "sensores"):
+            total = int(sensores["sensores"].sum())
+            activos = int(sensores.loc[sensores["estado"] == "activo", "sensores"].sum())
+            valor_total = f"{total:,}"
+            nota_total = " · ".join(
+                f"{fuente}: {int(cantidad)}"
+                for fuente, cantidad in sensores.groupby("fuente")["sensores"].sum().items()
+            )
+            valor_estado = f"{activos} / {total - activos}"
+            nota_estado = "activos / inactivos en el periodo"
+        else:
+            valor_total = valor_estado = self.KPI_SIN_DATOS
+            nota_total = nota_estado = None
+
+        self._tarjeta_kpi(col_1, "Número de sensores", valor_total,
+                          "Sensores físicos distintos (12 estaciones de contaminación y 10 dispositivos de clima). "
+                          "Fuente: PostgreSQL (vista sensores_unificados).", nota_total)
+
+        self._tarjeta_kpi(col_2, "Sensores activos / inactivos", valor_estado,
+                          "Un sensor está activo si tiene mediciones dentro del periodo del panel. "
+                          "Fuente: PostgreSQL (función estado_sensores).", nota_estado)
+
+        promedios = datos["promedios"]
+
+        if isinstance(promedios, str):
+            valor_med, nota_med = "Error", promedios
+        elif self._kpi_tiene(promedios, "tipo", "mediciones"):
+            # Un documento de clima trae temperatura, humedad y batería: se cuenta una sola vez (temperature)
+            cont = int(promedios.loc[promedios["tipo"].isin(["pm25", "pm10", "o3"]), "mediciones"].sum())
+            clima = int(promedios.loc[promedios["tipo"] == "temperature", "mediciones"].sum())
+            valor_med = f"{cont + clima:,}"
+            nota_med = f"contaminación: {cont:,} · clima: {clima:,}"
+        else:
+            valor_med, nota_med = self.KPI_SIN_DATOS, "No hay mediciones en el periodo."
+
+        self._tarjeta_kpi(col_3, "Mediciones recibidas", valor_med,
+                          "Mediciones registradas en el periodo: pm25 + pm10 + o3 + lecturas de clima "
+                          "(cada lectura de clima cuenta una vez aunque traiga temperatura, humedad y batería). "
+                          "Fuente: MongoDB.", nota_med)
+
+        col_4, col_5, col_6 = st.columns(3)
+
+        self._tarjeta_kpi(col_4, "Alertas generadas", valor_alertas,
+                          "Es la misma cifra de «Alertas ambientales»: lecturas sobre el límite de referencia. "
+                          "Fuente: MongoDB.", nota_alertas)
+
+        ritmo = datos["ritmo"]
+        ayuda_ritmo = (
+            "Mediciones recibidas divididas entre los {unidad} en que hubo datos (no entre todo el periodo, "
+            "para no diluir el ritmo real). Fuente: MongoDB."
+        )
+
+        for columna, titulo, campo, unidad in (
+            (col_5, "Datos por día", "por_dia", "días"),
+            (col_6, "Datos por hora", "por_hora", "horas"),
+        ):
+            with columna:
+                st.markdown(f"**{titulo}**", help=ayuda_ritmo.format(unidad=unidad))
+
+                if isinstance(ritmo, str):
+                    st.caption(f"Error: {ritmo}")
+                    continue
+
+                interior = st.columns(2)
+
+                for sub, fuente in zip(interior, ("contaminacion", "clima")):
+                    fila = ritmo[ritmo["fuente"] == fuente] if self._kpi_tiene(ritmo, "fuente", campo) else None
+
+                    with sub:
+                        if fila is None or fila.empty:
+                            st.metric(fuente.capitalize(), self.KPI_SIN_DATOS)
+                        else:
+                            st.metric(fuente.capitalize(), f"{fila.iloc[0][campo]:,.1f}")
+
+    # ============================================================
     # VISTA 7: CONSULTAS OBLIGATORIAS DE POSTGRESQL
     # ============================================================
 
@@ -1627,6 +1868,208 @@ class Dashboard:
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
     # ============================================================
+    # VISTA 10: PREGUNTAS DE HADOOP (MAPREDUCE) Y OPERACIONES DE HDFS
+    # ============================================================
+
+    HD_CARPETA_DEMO = "/tmp/demo_hdfs"
+    HD_ARCHIVO_DEMO = "/datasets/rising-hf.csv"   # ruta vista desde el contenedor namenode
+    HD_COPIA_LOCAL = "/tmp/rising_hf_copia.csv"
+    HD_OPERACIONES = ["-mkdir", "-put", "-ls", "-cat", "-get", "-rm"]
+
+    def consultar_hadoop(self, numero, parametros):
+        """
+        Ejecuta una pregunta de Hadoop (Queries_HDFS.CONSULTAS) con MapReduce.
+        El rango de fechas se toma del panel en el momento de ejecutar.
+        """
+
+        parametros = dict(parametros)
+        inicio, fin = self._rango_fechas()
+        parametros["fecha_ini"] = inicio.strftime("%Y-%m-%d")
+        parametros["fecha_fin"] = fin.strftime("%Y-%m-%d")
+
+        return self._a_pandas(self.queries_hdfs.ejecutar(numero, **parametros))
+
+    def _operacion_hdfs(self, operacion):
+        """Ejecuta una operación de HDFS sobre una carpeta de prueba y devuelve (comando, resultado)."""
+
+        h = self.queries_hdfs
+        demo = self.HD_CARPETA_DEMO
+
+        if operacion == "-mkdir":
+            h.crear_carpeta(demo)
+            return f"hdfs dfs -mkdir -p {demo}", f"Carpeta {demo} creada."
+
+        if operacion == "-put":
+            h.subir(self.HD_ARCHIVO_DEMO, f"{demo}/")
+            return f"hdfs dfs -put -f {self.HD_ARCHIVO_DEMO} {demo}/", "Archivo subido a HDFS."
+
+        if operacion == "-ls":
+            return f"hdfs dfs -ls {demo}", self._a_pandas(h.listar(demo))
+
+        if operacion == "-cat":
+            archivo = f"{demo}/rising-hf.csv"
+            return f"hdfs dfs -cat {archivo}  (primeras 5 líneas)", self._a_pandas(h.leer_archivo(archivo, 5))
+
+        if operacion == "-get":
+            h.descargar(f"{demo}/rising-hf.csv", self.HD_COPIA_LOCAL)
+            return (
+                f"hdfs dfs -get {demo}/rising-hf.csv {self.HD_COPIA_LOCAL}",
+                f"Copia descargada en {self.HD_COPIA_LOCAL} (dentro del contenedor namenode).",
+            )
+
+        h.eliminar(demo, recursivo=True)
+        return f"hdfs dfs -rm -r {demo}", "Carpeta de prueba eliminada."
+
+    def mostrar_consultas_hadoop(self):
+        st.subheader("10. Preguntas de Hadoop (MapReduce) y operaciones de HDFS")
+        st.caption(
+            "Tecnología: Hadoop (HDFS + MapReduce con Hadoop Streaming). Los jobs leen texto limpio "
+            "generado desde los Parquet de la capa processed, los mismos datos que usan PostgreSQL y MongoDB."
+        )
+
+        h = self.queries_hdfs
+
+        try:
+            listo = h.texto_listo()
+        except Exception as error:
+            st.error(f"No fue posible consultar HDFS: {error}")
+            return
+
+        if not listo:
+            st.warning("Falta el texto limpio que lee MapReduce (/data/mapreduce).")
+
+            if st.button("Preparar texto limpio en HDFS", key="btn_hd_preparar"):
+                with st.spinner("Exportando desde los Parquet..."):
+                    try:
+                        h.preparar_texto()
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"No fue posible preparar el texto: {error}")
+            return
+
+        consultas = h.CONSULTAS
+
+        numero = st.selectbox(
+            "Pregunta",
+            options=sorted(consultas),
+            format_func=lambda n: f"{n}. {consultas[n][0]}",
+            key="hd_consulta",
+        )
+
+        parametros = {}
+
+        if numero == 2:
+            parametros["n"] = st.number_input(
+                "Cantidad de sensores (top)", min_value=1, max_value=30, value=5, key="hd_n_2"
+            )
+        elif numero in (1, 5):
+            fuente = st.selectbox(
+                "Fuente",
+                options=["Todas", "contaminacion", "clima"],
+                key=f"hd_fuente_{numero}",
+            )
+
+            if fuente != "Todas":
+                parametros["fuente"] = fuente
+
+        try:
+            inicio, fin = self._rango_fechas()
+            st.caption(
+                f"Usa el rango del panel ({inicio:%d/%m/%Y} a {fin:%d/%m/%Y}). "
+                "Cada pregunta lanza un job MapReduce y puede tardar de 10 a 30 segundos."
+            )
+        except ValueError as error:
+            st.warning(str(error))
+
+        if st.button("Ejecutar pregunta", key="btn_hd"):
+            with st.spinner("Ejecutando job MapReduce..."):
+                actualizado = self._ejecutar_consulta(
+                    "hd_datos",
+                    lambda: self.consultar_hadoop(numero, parametros),
+                )
+
+            if actualizado:
+                st.session_state.hd_numero = numero
+
+        datos = st.session_state.hd_datos
+
+        if datos is not None:
+            mostrada = st.session_state.hd_numero
+            st.markdown(f"**Resultado de la pregunta {mostrada}: {consultas[mostrada][0]}**")
+
+            if datos.empty:
+                st.info("La consulta no devolvió resultados.")
+            else:
+                if mostrada in (1, 2, 5):
+                    grafico = datos.head(15)[["sensor_id", "mediciones"]].copy()
+                    grafico["sensor_id"] = grafico["sensor_id"].astype(str)
+                    st.bar_chart(grafico.set_index("sensor_id"))
+
+                elif mostrada == 3:
+                    total = datos[datos["sensor_id"] == "TODOS"]
+
+                    if not total.empty:
+                        st.metric("Temperatura promedio histórica (°C)", f"{total.iloc[0]['promedio_c']}")
+
+                    por_sensor = datos[datos["sensor_id"] != "TODOS"][["sensor_id", "promedio_c"]]
+                    st.bar_chart(por_sensor.set_index("sensor_id"))
+
+                elif mostrada == 4:
+                    self._grafico_por_dataset(datos, "zona", "eventos", "bar")
+
+                st.dataframe(datos, use_container_width=True, hide_index=True)
+
+        st.markdown("**Operaciones de HDFS** (sobre una carpeta de prueba, no tocan los datos del proyecto)")
+        st.caption(
+            f"Orden sugerido: -mkdir, -put, -ls, -cat, -get, -rm. El archivo de prueba es {self.HD_ARCHIVO_DEMO}."
+        )
+
+        operacion = st.selectbox("Operación", options=self.HD_OPERACIONES, key="hd_operacion")
+
+        if st.button("Ejecutar operación", key="btn_hd_op"):
+            try:
+                st.session_state.hd_op = self._operacion_hdfs(operacion)
+            except Exception as error:
+                st.error(f"La operación falló: {error}")
+
+        if st.session_state.hd_op is not None:
+            comando, resultado = st.session_state.hd_op
+            st.code(comando, language="bash")
+
+            if isinstance(resultado, str):
+                st.success(resultado)
+            else:
+                st.dataframe(resultado, use_container_width=True, hide_index=True)
+
+        st.markdown("**Distribución en bloques y datanodes**")
+        ruta = st.text_input(
+            "Archivo o carpeta de HDFS",
+            value="/data/raw/accidentes/US_Accidents_March23.csv",
+            key="hd_ruta_bloques",
+        )
+
+        if st.button("Ver bloques y estado del clúster", key="btn_hd_bloques"):
+            try:
+                st.session_state.hd_bloques = (
+                    self._a_pandas(h.bloques(ruta)),
+                    self._a_pandas(h.resumen_cluster()),
+                )
+            except Exception as error:
+                st.error(f"No fue posible leer los bloques: {error}")
+
+        if st.session_state.hd_bloques is not None:
+            bloques, cluster = st.session_state.hd_bloques
+            st.dataframe(cluster, use_container_width=True, hide_index=True)
+            st.write(f"Bloques del archivo: {len(bloques)}")
+            st.dataframe(bloques, use_container_width=True, hide_index=True)
+            st.caption(
+                "HDFS divide cada archivo en bloques de 128 MB y guarda cada bloque en un datanode; con más "
+                "datanodes y replicación mayor a 1, cada bloque tendría copias en nodos distintos y el archivo "
+                "seguiría disponible si uno falla. Este clúster tiene un solo datanode y replicación 1, "
+                "por lo que todos los bloques aparecen en el mismo nodo."
+            )
+
+    # ============================================================
     # ACTUALIZAR TODAS LAS VISTAS
     # ============================================================
 
@@ -1864,6 +2307,10 @@ class Dashboard:
 
         st.divider()
 
+        self.mostrar_kpis()
+
+        st.divider()
+
         self.mostrar_vista_1()
 
         st.divider()
@@ -1897,3 +2344,7 @@ class Dashboard:
         st.divider()
 
         self.mostrar_consultas_spark()
+
+        st.divider()
+
+        self.mostrar_consultas_hadoop()
