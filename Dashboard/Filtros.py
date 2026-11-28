@@ -21,9 +21,9 @@ class Filtros:
         self._usar_maximo = True 
         self._umbral = (True, 0.0)
 
-    # -------------------------
+
     # Get methods
-    # -------------------------
+    
 
     def get_zona(self):
         return self._zona
@@ -46,9 +46,8 @@ class Filtros:
     def get_umbral(self):
         return self._umbral
 
-    # -------------------------
+  
     # Set methods
-    # -------------------------
 
     def set_zona(self, valor):
         # None significa "todas las zonas" (sin filtro)

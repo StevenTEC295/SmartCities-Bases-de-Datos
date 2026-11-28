@@ -3,18 +3,9 @@ from pyspark.sql.window import Window
 
 
 class Queries_SP:
-    """
-    Consultas con Spark sobre los archivos Parquet de HDFS (/data/processed).
-    Todos los métodos devuelven DataFrames de Spark.
+    
 
-    Fuentes (todas en la capa processed, la misma que se carga a PostgreSQL y MongoDB):
-      accidentes/accidents  -> accidentes (state, city, severity, start_time_utc, ...)
-      contaminacion/{mediciones, sensores, parametros, locations}
-      clima/{mediciones, sensores}
-    Los métodos de periodo aceptan fecha_ini / fecha_fin ('AAAA-MM-DD', UTC); None = sin filtro.
-    """
-
-    # Divisiones del Censo de EE. UU. (misma definición que db/sensores_zonas.sql).
+    # Divisiones del Censo de EE. UU.
     ZONAS = {
         1: "New England", 2: "Mid-Atlantic", 3: "East North Central", 4: "West North Central",
         5: "South Atlantic", 6: "East South Central", 7: "West South Central", 8: "Mountain", 9: "Pacific",
@@ -30,8 +21,7 @@ class Queries_SP:
         **dict.fromkeys(["AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY"], 8),
         **dict.fromkeys(["AK", "CA", "HI", "OR", "WA"], 9),
     }
-    # Estado y coordenadas de las 4 estaciones de contaminación (las mismas de limpieza.ipynb).
-    # El Parquet de locations solo trae id y nombre.
+   
     UBICACIONES_CONTAMINACION = [
         (448, "MA", 42.3295, -71.0826),
         (626, "NY", 40.816, -73.902),
@@ -41,14 +31,14 @@ class Queries_SP:
 
     def __init__(self, spark: SparkSession, ruta: str, ruta_accidentes: str | None = None):
         self.spark = spark
-        self.ruta = ruta.rstrip("/")   # ej: hdfs://namenode:9000/data/processed
+        self.ruta = ruta.rstrip("/")  
         self.ruta_accidentes = (ruta_accidentes or f"{self.ruta}/accidentes/accidents").rstrip("/")
 
     def probar(self) -> None:
         """Comprueba la conexión: imprime los números 0 al 4 (la salida sale en la consola)."""
         self.spark.range(5).show()
 
-    # ---- Utilidades ----
+    
     def _leer(self, subruta: str) -> DataFrame:
         return self.spark.read.parquet(f"{self.ruta}/{subruta}")
 
@@ -84,12 +74,7 @@ class Queries_SP:
         return self.spark.createDataFrame(filas, "estado STRING, zona_id INT, zona STRING")
 
     def sensoresTipo(self) -> DataFrame:
-        """
-        Cantidad de sensores por tipo de parámetro (pm10, pm25, o3...) con su unidad.
-        Usa las tablas Parquet que genera limpieza.ipynb:
-        contaminacion/sensores (sensor_id, location_id, parameter_id) y
-        contaminacion/parametros (parameter_id, parameter, unit).
-        """
+        
         sensores = self._leer("contaminacion/sensores")
         parametros = self._leer("contaminacion/parametros")
         return (
@@ -148,7 +133,7 @@ class Queries_SP:
     # 2. Distribucion geografica de eventos (accidentes + contaminacion)
     def distribucion_geografica_eventos(self, top_n: int = 15, fecha_ini: str | None = None,
                                         fecha_fin: str | None = None) -> DataFrame:
-        """Eventos = accidentes por ciudad y mediciones de contaminación por estación."""
+       
         acc_geo = (
             self._accidentes(fecha_ini, fecha_fin)
             .filter(F.col("state").isNotNull() & F.col("city").isNotNull())
@@ -232,8 +217,7 @@ class Queries_SP:
 
     # 4. Correlacion entre variables (accidentes + contaminacion por periodo)
     def correlacion_variables(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
-        """Series mensuales de accidentes y contaminación en los meses en común, más el coeficiente
-        de correlación de Pearson GLOBAL (una sola cifra repetida en cada fila)."""
+     
         acc_mes = (
             self._accidentes(fecha_ini, fecha_fin)
             .withColumn("periodo", F.date_format(F.col("start_time_utc"), "yyyy-MM"))
@@ -278,8 +262,7 @@ class Queries_SP:
     # 5. Ranking de zonas con mayor actividad (accidentes + contaminacion)
     def ranking_zonas_actividad(self, top_n: int = 15, fecha_ini: str | None = None,
                                 fecha_fin: str | None = None) -> DataFrame:
-        """Ranking por zona del Censo (las mismas 9 zonas de PostgreSQL). Actividad = accidentes
-        y mediciones de contaminación. Clima no entra: sus zonas son simuladas (Australia)."""
+       
         estado_zona = self._estado_zona()
 
         acc_zonas = (
@@ -406,9 +389,8 @@ class Queries_SP:
 
     # 8. Agrupamiento por categorias (accidentes + contaminacion + clima)
     def agrupamiento_por_categorias(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
-        """Categorías: severidad (accidentes), sensor (contaminación) y dispositivo (clima).
-        El porcentaje se calcula con una ventana sobre el total (sin un count() extra)."""
-        w = Window.partitionBy()   # todo el conjunto: pocas filas ya agregadas
+       
+        w = Window.partitionBy()  
 
         def porcentaje():
             return F.round(F.col("total_registros") * 100.0 / F.sum("total_registros").over(w), 2).alias("porcentaje")
@@ -537,7 +519,7 @@ class Queries_SP:
     }
 
     def ejecutar(self, numero: int, **parametros) -> DataFrame:
-        """Ejecuta una consulta obligatoria por su número (ver CONSULTAS)."""
+        """Ejecuta una consulta obligatoria por su número"""
         if numero not in self.CONSULTAS:
             raise ValueError(f"Consulta {numero} no disponible. Disponibles: {sorted(self.CONSULTAS)}")
         return getattr(self, self.CONSULTAS[numero][1])(**parametros)

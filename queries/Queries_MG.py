@@ -5,22 +5,17 @@ from pyspark.sql import DataFrame, SparkSession, functions as F
 
 
 class Queries_MG:
-    """
-    Consultas a MongoDB SOLO con Aggregation Framework.
-    Cada consulta es un pipeline (lista de etapas) que se ejecuta dentro de Mongo
-    mediante mongo-spark-connector 10.x, vía Spark Connect.
-    Todos los métodos devuelven DataFrames de Spark.
-    """
+    
 
-    # El dashboard es de solo lectura: se rechazan las etapas que escriben datos
+    
     ETAPAS_PROHIBIDAS = {"$out", "$merge"}
 
     def __init__(self, spark: SparkSession, uri: str, base_datos: str):
         self.spark = spark
-        self.uri = uri                # ej: mongodb://mongo:27017  (nombre del servicio, puerto interno)
+        self.uri = uri               
         self.base_datos = base_datos
 
-    # ---------- Núcleo ----------
+  
     @classmethod
     def _validar(cls, pipeline: list) -> None:
         if not isinstance(pipeline, list) or not pipeline:
@@ -44,14 +39,14 @@ class Queries_MG:
             .option("aggregation.pipeline", json.dumps(pipeline))
             .load()
         )
-        # _id llega como struct (ObjectId) y no se grafica bien: se descarta si quedó
+       
         return df.drop("_id") if "_id" in df.columns else df
 
     def agregar(self, coleccion: str, pipeline: list) -> DataFrame:
         """Ejecuta un pipeline de agregación y devuelve el resultado como DataFrame de Spark."""
         return self._agregar(coleccion, pipeline)
 
-    # ---------- Consultas de ejemplo (cambia colección y campos por los de tu base) ----------
+    
     def conteo_por_campo(self, coleccion: str, campo: str) -> DataFrame:
         return self.agregar(coleccion, [
             {"$group": {"_id": f"${campo}", "total": {"$sum": 1}}},
@@ -79,17 +74,6 @@ class Queries_MG:
             {"$sort": {"fecha": 1}},
         ])
 
-    # =====================================================================
-    # Consultas obligatorias de MongoDB (Aggregation Framework)
-    # =====================================================================
-    # Mongo guarda solo el id del sensor. El filtrado y la agregación se hacen en Mongo; el
-    # resultado (ya agregado y pequeño) se une en Spark con `sensores`, el DataFrame de
-    # Queries_PG.sensores_metadata() (fuente, sensor_id, nombre, zona, zona_simulada, parametro).
-    # OJO: el conector parte las colecciones grandes en particiones y ejecuta el pipeline en cada una.
-    # Por eso Mongo calcula resultados PARCIALES (sumas, conteos, mínimos, máximos) y Spark los
-    # combina; así el resultado no depende del tamaño de la colección.
-
-    # variable -> (colección, campo del sensor, campo de fecha, campo del valor)
     VARIABLES = {
         "temperature": ("clima_measurements", "dev_id", "time", "temperature"),
         "humidity": ("clima_measurements", "dev_id", "time", "humidity"),
@@ -165,7 +149,7 @@ class Queries_MG:
             F.concat_ws(" - ", F.col("nombre"), F.coalesce(F.col("parametro"), F.col("sensor").cast("string"))),
         )
 
-    # ---- 1. Lecturas de un sensor específico ----
+    # Lecturas de un sensor específico
     def lecturas_sensor(self, variable: str, sensor_id, n: int = 20, sensores: DataFrame | None = None) -> DataFrame:
         """Las últimas n lecturas de un sensor."""
         coleccion, c_sensor, c_fecha, c_valor = self._config(variable)
@@ -177,7 +161,7 @@ class Queries_MG:
         df = self.agregar(coleccion, pipeline)
         return df.orderBy(F.desc("fecha")).limit(int(n)) if "fecha" in df.columns else df
 
-    # ---- 2. Lecturas en un rango de fechas (y filtros múltiples: sensor, fechas y rango de valor) ----
+    # Lecturas en un rango de fechas
     def lecturas_rango(self, variable: str, fecha_ini: str | None = None, fecha_fin: str | None = None,
                        sensor_id=None, valor_min=None, valor_max=None, n: int = 100,
                        sensores: DataFrame | None = None) -> DataFrame:
@@ -191,7 +175,7 @@ class Queries_MG:
         df = self.agregar(coleccion, pipeline)
         return df.orderBy(F.asc("fecha")).limit(int(n)) if "fecha" in df.columns else df
 
-    # ---- 3. Valores máximos y mínimos (de un sensor, de cada sensor o de todos juntos) ----
+    # Valores máximos y mínimos 
     def extremos(self, variable: str, sensor_id=None, por_sensor: bool = False,
                  fecha_ini: str | None = None, fecha_fin: str | None = None,
                  sensores: DataFrame | None = None) -> DataFrame:
@@ -219,7 +203,7 @@ class Queries_MG:
             resultado = self._con_metadata(resultado, sensores)
         return resultado
 
-    # ---- 4. Sensores que superaron el límite (el límite lo define el usuario) ----
+    # Sensores que superaron el límite
     def sensores_sobre_limite(self, variable: str, limite: float, superior: bool = True,
                               fecha_ini: str | None = None, fecha_fin: str | None = None,
                               sensores: DataFrame | None = None) -> DataFrame:
@@ -245,7 +229,7 @@ class Queries_MG:
         return (resultado.select("etiqueta", "sensor", "nombre", "zona", "eventos", "extremo")
                 .orderBy(F.desc("eventos")))
 
-    # ---- 5. Alertas por zona (opción A: se calculan al vuelo con el límite; no se guarda nada) ----
+    # Alertas por zona 
     def alertas_por_zona(self, variable: str, limite: float, superior: bool = True,
                          fecha_ini: str | None = None, fecha_fin: str | None = None,
                          sensores: DataFrame | None = None) -> DataFrame:
@@ -258,7 +242,7 @@ class Queries_MG:
                      F.countDistinct("sensor").alias("sensores_en_alerta"))
                 .orderBy(F.desc("alertas")))
 
-    # ---- 6. Promedio de mediciones por zona (o por ubicación) ----
+    #  Promedio de mediciones por zona
     def promedio_por_zona(self, variable: str, por: str = "zona", fecha_ini: str | None = None,
                           fecha_fin: str | None = None, sensores: DataFrame | None = None) -> DataFrame:
         """Promedio de una variable por zona. por='ubicacion' agrupa por nombre del sensor/estación."""
@@ -278,7 +262,7 @@ class Queries_MG:
                      F.sum("mediciones").alias("mediciones"))
                 .orderBy(F.desc("promedio")))
 
-    # ---- 7. Promedio por tipo de sensor ----
+    #Promedio por tipo de sensor
     def promedio_por_tipo_sensor(self, fecha_ini: str | None = None, fecha_fin: str | None = None,
                                  sensores: DataFrame | None = None) -> DataFrame:
         """Promedio de cada tipo de sensor (pm25, pm10, o3, temperature, humidity, battery)."""
@@ -303,10 +287,10 @@ class Queries_MG:
             resultado = resultado.unionByName(parte)
         return resultado.orderBy("tipo")
 
-    # ---- 8. Mediciones por sensor ----
+    # Mediciones por sensor 
     def mediciones_por_sensor(self, fecha_ini: str | None = None, fecha_fin: str | None = None,
                               sensores: DataFrame | None = None) -> DataFrame:
-        """Cantidad de mediciones de cada sensor (contaminación y clima)."""
+        """Cantidad de mediciones de cada sensor"""
         partes = []
         for variable in ("pm25", "temperature"):   # una variable por colección
             coleccion, c_sensor, _, _ = self._config(variable)
@@ -328,7 +312,7 @@ class Queries_MG:
         columnas = [c for c in ("etiqueta", "sensor", "fuente", "nombre", "zona", "mediciones") if c in resultado.columns]
         return resultado.select(*columnas).orderBy(F.desc("mediciones"))
 
-    # ---- 9. Incidentes (accidentes) por categoría: condición climática en el momento del accidente ----
+    # Incidentes (accidentes) por categoría: condición climática en el momento del accidente
     def accidentes_por_condicion(self, fecha_ini: str | None = None, fecha_fin: str | None = None,
                                  n: int = 15) -> DataFrame:
         filtro = {}
@@ -349,7 +333,7 @@ class Queries_MG:
         return (df.groupBy("condicion").agg(F.sum("accidentes").alias("accidentes"))
                 .orderBy(F.desc("accidentes")).limit(int(n)))
 
-    # ---- 10. Evolución de una variable durante un periodo ----
+    #  Evolución de una variable durante un periodo 
     def evolucion_variable(self, variable: str, fecha_ini: str | None = None, fecha_fin: str | None = None,
                            sensor_id=None, granularidad: str = "dia",
                            sensores: DataFrame | None = None) -> DataFrame:
@@ -377,13 +361,12 @@ class Queries_MG:
                      F.sum("mediciones").alias("mediciones"))
                 .orderBy("fecha"))
 
-    # ---------- Consultas de apoyo a los KPIs del dashboard ----------
+    # Consultas de apoyo a los KPIs del dashboard
 
-    # Límites de referencia por contaminante  Una alerta es una lectura que SUPERA el límite.
+    # Límites de referencia por contaminante 
     LIMITES_ALERTA = {"pm25": 35.0, "pm10": 150.0, "o3": 0.070}
 
-    # Una condición climática de accidente es "adversa" si contiene alguna de estas palabras
-    # (precipitación, tormenta o visibilidad reducida)
+   
     CLIMA_ADVERSO = (
         "Rain", "Drizzle", "Snow", "Sleet", "Freezing", "Ice", "Wintry", "Shower", "Hail",
         "Thunder", "Storm", "Fog", "Haze", "Mist", "Smoke", "Dust", "Sand", "Ash", "Tornado", "Squall",
@@ -419,12 +402,10 @@ class Queries_MG:
         return resultado
 
     def kpi_ritmo_datos(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
-        """Ritmo de recepción por fuente (contaminación y clima): mediciones por día y por hora,
-        calculados solo sobre los días/horas CON datos (no sobre todo el periodo, que diluiría el ritmo).
-        Devuelve (fuente, mediciones, dias_con_datos, horas_con_datos, por_dia, por_hora)."""
+        
         partes = []
         for fuente, variable in (("contaminacion", "pm25"), ("clima", "temperature")):
-            # ids=None: toda la colección de esa fuente (solo se filtra por fechas)
+            # ids=None: toda la colección de esa fuente 
             coleccion, _, campo_fecha, _ = self._config(variable)
             pipeline = self._match(variable, None, fecha_ini, fecha_fin) + [
                 {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d %H", "date": f"${campo_fecha}"}},
@@ -454,8 +435,7 @@ class Queries_MG:
         return resultado
 
     def kpi_clima_adverso(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
-        """% de accidentes con clima adverso (ver CLIMA_ADVERSO). Reutiliza accidentes_por_condicion
-        y clasifica cada condición en Spark. Devuelve (accidentes, adversos, porcentaje)."""
+        
         condiciones = self.accidentes_por_condicion(fecha_ini, fecha_fin, n=1000)
         if "condicion" not in condiciones.columns:
             return condiciones
@@ -465,7 +445,7 @@ class Queries_MG:
                     F.sum(F.when(adversa, F.col("accidentes")).otherwise(0)).cast("long").alias("adversos"))
                 .withColumn("porcentaje", F.round(F.col("adversos") * 100.0 / F.col("accidentes"), 2)))
 
-    # Registro de consultas obligatorias: número -> (descripción, método)
+    # Registro de consultas obligatorias
     CONSULTAS = {
         1: ("Lecturas de un sensor específico", "lecturas_sensor"),
         2: ("Lecturas en un rango de fechas (filtros múltiples)", "lecturas_rango"),

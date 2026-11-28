@@ -1,4 +1,4 @@
--- Esquema de sensores. Se ejecuta solo la primera vez que se crea el volumen de PostgreSQL.
+-- Esquema de sensores
 
 CREATE TABLE Sensors_table (
     dev_id    VARCHAR(12) PRIMARY KEY,

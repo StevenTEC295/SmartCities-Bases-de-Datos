@@ -1,8 +1,4 @@
 -- Vista unica de sensores para el dashboard.
--- No duplica datos: se calcula en cada consulta a partir de las tablas base, que conservan
--- sus claves primarias y foraneas (sensores -> locations, sensores -> parametros, sensores -> organismos).
--- Zonas: contaminacion usa el estado de su estacion; clima (Australia) se asigna de forma SIMULADA,
--- rotando los dispositivos (ordenados por dev_id) entre las zonas. zona_simulada lo indica.
 
 
 CREATE OR REPLACE VIEW sensores_unificados AS

@@ -16,27 +16,7 @@ from pyspark.sql.types import (
 
 
 class Dashboard:
-    """
-    Dashboard de SmartCities.
-
-    Cada vista conserva sus últimos resultados en st.session_state.
-    Las consultas se ejecutan únicamente cuando se presiona el botón
-    de actualización correspondiente.
-
-    Categorías:
-        accidentes
-        temperature
-        humidity
-        o3
-        pm10
-        pm25
-
-    Orígenes:
-        Departamento de transporte EE. UU.
-        Victorian Government, Australia
-        Open AQ
-    """
-
+    
     LIMITE_FILAS = 500
     
     LIMITE_SERIE = 5000
@@ -61,14 +41,12 @@ class Dashboard:
         "Open AQ",
     ]
 
-    # Rango real de los datos: desde el accidente más antiguo (2016-01-14)
-    # hasta la última medición de contaminación (2026-11-04).
+    
 
     FECHA_MINIMA = date(2016, 1, 14)
     FECHA_MAXIMA = date(2026, 11, 4)
 
-    # Zonas del dataset de contaminación. Las de accidentes son códigos de estado
-    # de 2 letras (MA, NY...) y el resto son los dispositivos de clima.
+    
     ZONAS_CONTAMINACION = (
         "Boston - Roxbury",
         "Bronx - IS52",
@@ -95,9 +73,9 @@ class Dashboard:
         self.titulo = titulo
         
 
-    # ============================================================
+    
     # INICIALIZACIÓN Y ESTADO
-    # ============================================================
+ 
 
     def _inicializar_estado(self):
         """
@@ -161,10 +139,7 @@ class Dashboard:
             st.error(f"No fue posible actualizar la consulta: {error}")
             return False
 
-    # ============================================================
-    # UTILIDADES
-    # ============================================================
-
+  
     @staticmethod
     def _sql_texto(valor):
         """Escapa comillas simples para literales SQL."""
@@ -230,11 +205,7 @@ class Dashboard:
         return inicio, fin
 
     def _mongo_pipeline_fechas(self, campo):
-        """
-        Genera un $match de MongoDB para el rango seleccionado.
-
-        Utiliza Extended JSON para representar fechas BSON.
-        """
+       
 
         inicio, fin = self._rango_fechas()
 
@@ -253,14 +224,7 @@ class Dashboard:
         ]
 
     def _a_pandas(self, spark_df, limite=None):
-        """
-        Convierte un Spark DataFrame a Pandas.
-
-        Se utiliza después de agregar y limitar los resultados,
-        no para descargar grandes colecciones completas.
-        Sin `limite` se usa LIMITE_FILAS (para tablas); las series
-        diarias pasan LIMITE_SERIE.
-        """
+       
 
         if limite is None:
             limite = self.LIMITE_FILAS
@@ -331,11 +295,7 @@ class Dashboard:
         ]
 
     def _zona(self, dataset=None):
-        """
-        Zona seleccionada. Si se indica el dataset que se va a leer, devuelve
-        la zona solo cuando pertenece a ese dataset; si no, None (sin filtro de
-        zona). Así una zona de otro dataset no deja resultados vacíos.
-        """
+        
 
         zona = self.filtros.get_zona()
 
@@ -346,10 +306,6 @@ class Dashboard:
             return None
 
         return zona
-
-    # ============================================================
-    # LECTURA DE LOS DATASETS
-    # ============================================================
 
     def _leer_accidentes(self):
         """
@@ -386,13 +342,7 @@ class Dashboard:
         return self.queries_pg.consultar(sql)
 
     def _leer_clima(self):
-        """
-        Lee mediciones de clima desde MongoDB y las relaciona
-        con la metadata de sensores almacenada en PostgreSQL.
-
-        Retorna:
-            dev_id, name, time, temperature, humidity
-        """
+       
 
         pipeline = self._mongo_pipeline_fechas("time")
 
@@ -436,10 +386,6 @@ class Dashboard:
         """
         Lee mediciones de contaminación desde MongoDB y las relaciona
         con sensores, ubicaciones y parámetros de PostgreSQL.
-
-        Retorna:
-            sensor_id, datetime_utc, value,
-            location_name, parameter
         """
 
         pipeline = self._mongo_pipeline_fechas("datetime_utc")
@@ -491,9 +437,7 @@ class Dashboard:
 
         return self._leer_contaminacion()
 
-    # ============================================================
-    # AGREGACIONES COMUNES
-    # ============================================================
+ 
 
     def _columna_fecha(self, df, campo):
         """
@@ -568,9 +512,8 @@ class Dashboard:
         resultado = resultado.orderBy("dia")
 
         return self._a_pandas(resultado, self.LIMITE_SERIE)
-    # ============================================================
+  
     # VISTA 1: CANTIDAD DE SENSORES POR TIPO
-    # ============================================================
 
 
 
@@ -661,9 +604,8 @@ class Dashboard:
                     datos.set_index("Tipo")
                 )
 
-    # ============================================================
     # VISTA 2: RANKING DE UBICACIONES
-    # ============================================================
+ 
 
     def consultar_vista_2(self):
         categoria = self.filtros.get_categoria()
@@ -739,9 +681,9 @@ class Dashboard:
                     hide_index=True,
                 )
 
-    # ============================================================
+  
     # VISTA 3: PRIMERA TENDENCIA TEMPORAL
-    # ============================================================
+
 
     def consultar_tendencia_1(self):
         categoria = self.filtros.get_categoria()
@@ -781,9 +723,9 @@ class Dashboard:
 
                 st.line_chart(grafico)
 
-    # ============================================================
+  
     # VISTA 4: SEGUNDA TENDENCIA Y CORRELACIÓN
-    # ============================================================
+
 
     def consultar_tendencia_2(self):
         categoria = st.session_state.categoria_tendencia_2
@@ -929,9 +871,9 @@ class Dashboard:
                     f"Calculado con {cantidad} días coincidentes."
                 )
 
-    # ============================================================
+  
     # VISTA 5: CANTIDAD DE MEDICIONES POR SENSOR
-    # ============================================================
+ 
 
     def consultar_vista_5(self):
         categoria = self.filtros.get_categoria()
@@ -1000,9 +942,9 @@ class Dashboard:
                     hide_index=True,
                 )
 
-    # ============================================================
+  
     # VISTA 6: EVENTOS CRÍTICOS
-    # ============================================================
+  
 
     def consultar_vista_6(self):
         categoria = self.filtros.get_categoria()
@@ -1094,9 +1036,9 @@ class Dashboard:
                     hide_index=True,
                 )
 
-    # ============================================================
+
     # KPIs (MÉTRICAS CLAVE): AMBIENTE E IoT
-    # ============================================================
+
 
     KPI_SIN_DATOS = "Sin datos"
 
@@ -1186,7 +1128,7 @@ class Dashboard:
             st.info("Presione «Actualizar KPIs» para calcular los indicadores.")
             return
 
-        # ---------------- Ambiente ----------------
+        # Ambiente
         st.markdown("**Ambiente**")
         col_1, col_2, col_3 = st.columns(3)
 
@@ -1247,7 +1189,7 @@ class Dashboard:
 
         self._tarjeta_kpi(col_6, "% accidentes con clima adverso", valor_adverso, ayuda_adverso, nota_adverso)
 
-        # ---------------- IoT ----------------
+        
         st.markdown("**IoT**")
         col_1, col_2, col_3 = st.columns(3)
 
@@ -1330,9 +1272,9 @@ class Dashboard:
                         else:
                             st.metric(fuente.capitalize(), f"{fila.iloc[0][campo]:,.1f}")
 
-    # ============================================================
+
     # VISTA 7: CONSULTAS OBLIGATORIAS DE POSTGRESQL
-    # ============================================================
+  
 
     # Opciones del formulario de la consulta 9 (la vista sensores_unificados).
     PG_FUENTES = ["Todas", "clima", "contaminacion"]
@@ -1356,9 +1298,6 @@ class Dashboard:
         """
         Ejecuta una consulta obligatoria de PostgreSQL (Queries_PG.CONSULTAS).
 
-        La 5 usa la cantidad del ranking del panel; la 3, 7, 8 y 10 usan el rango
-        de fechas del panel; la 8 también usa el máximo/mínimo del panel; la 10
-        usa la zona si es un estado; la 9 recibe sus filtros.
         """
 
         if numero == 5:
@@ -1487,14 +1426,13 @@ class Dashboard:
 
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
-    # ============================================================
     # VISTA 8: CONSULTAS OBLIGATORIAS DE MONGODB
-    # ============================================================
+    
 
     MG_VARIABLES = ["temperature", "humidity", "pm25", "pm10", "o3"]
     MG_VARIABLES_CLIMA = ("temperature", "humidity")
 
-    # número -> (columna de etiqueta, columna de valor, tipo de gráfico). La 3 y la 7 solo llevan tabla.
+  
     MG_EJES = {
         1: ("fecha", "valor", "line"),
         2: ("fecha", "valor", "line"),
@@ -1592,7 +1530,6 @@ class Dashboard:
 
             sensores = self._sensores_mongo(variable)
 
-            # Sensor: obligatorio en la 1, opcional en la 2 y la 10, y según el alcance en la 3.
             if numero == 3:
                 alcance = st.selectbox(
                     "Alcance",
@@ -1703,12 +1640,10 @@ class Dashboard:
 
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
-    # ============================================================
+  
     # VISTA 9: CONSULTAS OBLIGATORIAS DE SPARK
-    # ============================================================
+    
 
-    # número -> (columna X, columna Y, tipo de gráfico) de cada gráfico por dataset.
-    # La 3 y la 10 tienen un tratamiento propio (ver mostrar_consultas_spark).
     SP_EJES = {
         1: ("nombre", "mediciones", "bar"),
         2: ("ubicacion", "total_registros", "bar"),
@@ -1867,9 +1802,9 @@ class Dashboard:
 
         st.dataframe(datos, use_container_width=True, hide_index=True)
 
-    # ============================================================
+   
     # VISTA 10: PREGUNTAS DE HADOOP (MAPREDUCE) Y OPERACIONES DE HDFS
-    # ============================================================
+   
 
     HD_CARPETA_DEMO = "/tmp/demo_hdfs"
     HD_ARCHIVO_DEMO = "/datasets/rising-hf.csv"   # ruta vista desde el contenedor namenode
@@ -2069,9 +2004,8 @@ class Dashboard:
                 "por lo que todos los bloques aparecen en el mismo nodo."
             )
 
-    # ============================================================
+  
     # ACTUALIZAR TODAS LAS VISTAS
-    # ============================================================
 
     def actualizar_todas(self):
         """
@@ -2101,10 +2035,9 @@ class Dashboard:
         except Exception as error:
             st.error(f"Error al actualizar eventos críticos: {error}")
 
-    # ============================================================
+  
     # PANEL DE FILTROS
-    # ============================================================
-
+   
     def mostrar_filtros(self):
         st.sidebar.header("Filtros globales")
 
@@ -2281,9 +2214,9 @@ class Dashboard:
         self.filtros.set_umbral((activar, numero))
 
 
-    # ============================================================
+  
     # EJECUCIÓN DEL DASHBOARD
-    # ============================================================
+    
 
     def run(self):
         st.set_page_config(

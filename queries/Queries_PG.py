@@ -27,12 +27,12 @@ class Queries_PG:
 
     def consultar(self, sql: str) -> DataFrame:
         """Ejecuta un SELECT en PostgreSQL (el trabajo lo hace la base) y devuelve un DataFrame de Spark."""
-        sql = sql.strip().rstrip(";")   # la opción JDBC `query` no admite punto y coma final
+        sql = sql.strip().rstrip(";")   
         if not sql:
             raise ValueError("El SQL está vacío")
         return self._leer(sql)
 
-    # ---- Consultas de ejemplo sobre el esquema de db/init.sql y db/accidents.sql ----
+    # Consultas de ejemplo sobre el esquema de db/init.sql y db/accidents.sql 
     def top_ubicaciones(self, n: int = 10) -> DataFrame:
         """Ubicaciones con más sensores."""
         n = int(n)
@@ -58,9 +58,7 @@ class Queries_PG:
             """
         )
 
-    # ---- Consultas obligatorias de PostgreSQL (se leen de la vista sensores_unificados) ----
-    # En clima cada dispositivo aparece 3 veces en la vista (temperatura, humedad, batería);
-    # por eso los conteos de sensores usan COUNT(DISTINCT (fuente, sensor_id)).
+
 
     @staticmethod
     def _txt(valor: str) -> str:
@@ -146,7 +144,7 @@ class Queries_PG:
         est = self._txt(estado) if estado else "NULL::text"
         return self.consultar(f"SELECT severity, accidentes FROM accidentes_por_severidad({ini}, {fin}, {est})")
 
-    # ---- Consultas que usan las zonas y las fechas por sensor (db/sensores_zonas.sql) ----
+    # Consultas que usan las zonas y las fechas por sensor 
 
     @classmethod
     def _rango(cls, fecha_ini: str | None, fecha_fin: str | None) -> tuple[str, str]:
@@ -231,9 +229,7 @@ class Queries_PG:
         )
 
     def sensores_metadata(self) -> DataFrame:
-        """Una fila por sensor físico (fuente, sensor_id, nombre, zona, zona_simulada, parametro).
-        `parametro` solo existe en contaminación (en clima cada dispositivo mide varias variables).
-        Lo usa Queries_MG para poner nombre y zona a los resultados de Mongo."""
+       
         return self.consultar(
             """
             SELECT fuente, sensor_id, nombre, zona, zona_simulada,
@@ -244,7 +240,7 @@ class Queries_PG:
             """
         )
 
-    # Registro de consultas obligatorias: id -> (descripción, método)
+    # Registro de consultas obligatorias
     CONSULTAS = {
         1: ("Sensores por tipo", "sensores_por_tipo"),
         2: ("Sensores por ubicación", "sensores_por_ubicacion"),

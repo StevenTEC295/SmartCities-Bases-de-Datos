@@ -1,8 +1,5 @@
 -- Zonas del proyecto: las 9 divisiones del Censo de EE. UU. (agrupadas en 4 regiones).
--- Sirven para relacionar los datasets: accidentes (ciudad -> estado -> zona), estaciones de
--- contaminacion (locations.state_code -> estado -> zona) y clima de Australia (asignacion simulada
--- en la vista sensores_unificados).
--- Idempotente: se puede ejecutar varias veces.
+
 
 CREATE TABLE IF NOT EXISTS zonas (
     zona_id SMALLINT PRIMARY KEY,
@@ -41,7 +38,7 @@ INSERT INTO estados_zona (state_code, zona_id) VALUES
 ON CONFLICT DO NOTHING;
 
 -- Estado de cada estacion de contaminacion. Los notebooks lo escriben al cargar locations;
--- el UPDATE sirve para bases que ya tienen las estaciones cargadas (no hace nada si estan vacias).
+
 ALTER TABLE locations ADD COLUMN IF NOT EXISTS state_code TEXT REFERENCES estados_zona(state_code);
 
 UPDATE locations SET state_code = v.state_code
@@ -49,8 +46,7 @@ FROM (VALUES (448, 'MA'), (626, 'NY'), (739, 'DC'), (2139, 'MD')) AS v(location_
 WHERE locations.location_id = v.location_id AND locations.state_code IS NULL;
 
 -- Fecha de la primera y de la ultima medicion de cada sensor.
--- Las mediciones viven en MongoDB: los notebooks calculan MIN/MAX y las escriben aqui al cargar.
--- Se usan para sensores instalados por anio, activos/inactivos y sin actividad.
+
 ALTER TABLE sensores      ADD COLUMN IF NOT EXISTS fecha_inicio_datos TIMESTAMP;
 ALTER TABLE sensores      ADD COLUMN IF NOT EXISTS fecha_fin_datos    TIMESTAMP;
 ALTER TABLE sensors_table ADD COLUMN IF NOT EXISTS fecha_inicio_datos TIMESTAMP;

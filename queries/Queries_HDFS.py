@@ -16,28 +16,13 @@ class Queries_HDFS:
     """
     HDFS y Hadoop MapReduce en una sola clase. Todos los métodos que devuelven datos
     devuelven DataFrames de Spark.
-
-    - Comandos de HDFS (`hdfs dfs ...` dentro del contenedor namenode):
-        listar, existe, es_carpeta, crear_carpeta, subir
-    - Lectura de archivos con Spark: cargar_csv
-    - Consultas MapReduce (`hadoop jar ...`): agrupar, contar_palabras, ejecutar_streaming.
-      El resultado del job se lee con `hdfs dfs -cat` y se convierte en DataFrame de Spark.
-
-    Tus datos viven en `base_uri` (ej. hdfs://namenode:9000/data/processed/): las rutas
-    relativas ("ventas.csv", "ventas_dir") se buscan ahí; las que empiezan con "/" o "hdfs://"
-    se usan tal cual.
-
-    No necesitas Hadoop en tu PC: los comandos se ejecutan con `docker exec namenode ...`.
-    Con docker exec, las rutas LOCALES (ej. en `subir`) son las del contenedor
-    (tu carpeta ./datasets está montada en /datasets).
-    Sin YARN en el cluster, Hadoop ejecuta los jobs en modo local (una sola JVM del namenode).
     """
 
     # Operaciones del reducer (k = clave del grupo)
     OPERACIONES = {"sum": "s[k]", "count": "c[k]", "avg": "s[k]/c[k]", "min": "mn[k]", "max": "mx[k]"}
     SEPARADORES = {",", ";", "|"}
     OPERADORES_FILTRO = {"==", "!=", ">", ">=", "<", "<="}
-    _TEXTO_SEGURO = re.compile(r"^[\w .\-]+$")   # sin comillas, $, \ ni otros caracteres especiales
+    _TEXTO_SEGURO = re.compile(r"^[\w .\-]+$")   
 
     _ESQUEMA_LISTAR = StructType([
         StructField("tipo", StringType()),
@@ -74,8 +59,7 @@ class Queries_HDFS:
         ruta_texto: str | None = None,
     ):
         self.spark = spark
-        self.base_uri = base_uri.rstrip("/")     # carpeta de tus datos en HDFS
-        # Texto limpio (CSV sin encabezado) que lee MapReduce; se genera con preparar_texto()
+        self.base_uri = base_uri.rstrip("/")    
         self.ruta_texto = (ruta_texto or self.base_uri.rsplit("/", 1)[0] + "/mapreduce").rstrip("/")
         self.comando = shlex.split(comando)
         self.comando_hadoop = shlex.split(comando_hadoop)
@@ -85,16 +69,9 @@ class Queries_HDFS:
         self.timeout = timeout
         self.timeout_job = timeout_job
 
-    # =====================================================================
-    #  Comandos de HDFS
-    # =====================================================================
+ 
     def _resolver(self, ruta: str | None = "") -> str:
-        """
-        Convierte una ruta en la ruta completa de HDFS:
-          ""  o  "ventas.csv"        -> relativa a base_uri  (hdfs://namenode:9000/data/processed/...)
-          "/otra/carpeta/x.csv"      -> ruta absoluta de HDFS, tal cual
-          "hdfs://host:9000/x.csv"   -> URI completa, tal cual
-        """
+      
         ruta = (ruta or "").strip()
         if ruta.startswith("-"):   # evita que una ruta se interprete como opción del comando (ej. "-rm")
             raise ValueError(f"Ruta inválida: {ruta!r}")
@@ -153,11 +130,7 @@ class Queries_HDFS:
 
     def cargar_csv(self, ruta: str, limite: int = 10000, sep: str = ",",
                    encabezado: bool = True, inferir_tipos: bool = True) -> DataFrame:
-        """
-        Lee un CSV (archivo, carpeta con varios archivos o patrón) de HDFS con Spark y devuelve
-        un DataFrame limitado a `limite` filas. Con inferir_tipos=False todas las columnas
-        quedan como texto y Spark solo lee lo mínimo (útil para obtener los nombres de columna).
-        """
+        
         return (
             self.spark.read.option("header", encabezado).option("sep", sep)
             .option("inferSchema", inferir_tipos)
@@ -173,15 +146,11 @@ class Queries_HDFS:
         """`hdfs dfs -put -f <origen_local> <destino>` (origen = ruta vista por el comando)."""
         self._ejecutar("-put", "-f", self._validar_local(origen_local), self._resolver(destino))
 
-    # =====================================================================
+
     #  Hadoop MapReduce sobre los datos de HDFS
-    # =====================================================================
+   
     def _correr_job(self, jar: str, armar_args) -> str:
-        """
-        Ejecuta `hadoop jar <jar> <args>` con una carpeta de salida única, lee part-*
-        y limpia la carpeta temporal. `armar_args(salida)` devuelve los argumentos del job.
-        Devuelve el texto de salida del job (líneas `clave<TAB>valor`).
-        """
+       
         salida = f"{self.carpeta_salida}/{uuid.uuid4().hex}"
         try:
             r = subprocess.run(
@@ -201,7 +170,7 @@ class Queries_HDFS:
                     pass
 
     def _texto_a_df(self, texto: str, columnas) -> DataFrame:
-        """Convierte líneas separadas por tabulador en un DataFrame de Spark (columnas de texto)."""
+       
         n = len(columnas)
         filas = []
         for linea in texto.splitlines():
@@ -215,11 +184,7 @@ class Queries_HDFS:
 
     def ejecutar_streaming(self, entrada: str, mapper: str, reducer: str,
                            columnas: tuple = ("clave", "valor")) -> DataFrame:
-        """
-        Hadoop Streaming: mapper y reducer son comandos que leen stdin y escriben
-        líneas `clave<TAB>valor` en stdout. Devuelve la salida como DataFrame de Spark
-        (todas las columnas de texto).
-        """
+      
         def args(salida):
             return ["-D", "mapreduce.job.reduces=1", "-input", self._resolver(entrada), "-output", salida,
                     "-mapper", mapper, "-reducer", reducer]
@@ -263,28 +228,14 @@ class Queries_HDFS:
 
     def agrupar(self, ruta: str, col_grupo, col_valor, operacion: str = "sum",
                 sep: str = ",", encabezado: bool = True, donde: list | None = None) -> DataFrame:
-        """
-        GROUP BY con MapReduce sobre datos que YA están en HDFS. Devuelve un DataFrame de Spark
-        con dos columnas (grupo y valor numérico) ordenado de mayor a menor.
-
-        ruta        archivo, carpeta (todos sus archivos) o patrón, relativos a base_uri (ventas_*.csv)
-        col_grupo   nombre de columna (si hay encabezado) o posición 1, 2, 3...
-        col_valor   columna numérica a agregar (nombre o posición)
-        operacion   sum, count, avg, min o max
-        donde       filtros opcionales (AND): [("region", "==", "Norte"), ("ingresos", ">", 100)]
-
-        Ejemplos:
-          agrupar("ventas.csv", "region", "ingresos", "sum")
-          agrupar("ventas_dir", 2, 4, "avg", encabezado=False, donde=[(2, "==", "Norte")])
-        Limitación: CSV simple (sin separadores dentro de campos entre comillas).
-        """
+     
         if operacion not in self.OPERACIONES:
             raise ValueError(f"Operación inválida: {operacion}. Usa: {sorted(self.OPERACIONES)}")
         if sep not in self.SEPARADORES:
             raise ValueError(f"Separador inválido: {sep!r}. Usa uno de {sorted(self.SEPARADORES)}")
         ruta = self._resolver(ruta).rstrip("/") or "/"
 
-        # Solo se leen los nombres de columna (con Spark) si hace falta resolverlos
+        # Solo se leen los nombres de columna
         usa_nombres = encabezado and any(
             isinstance(c, str) for c in [col_grupo, col_valor, *[d[0] for d in (donde or [])]]
         )
@@ -309,22 +260,22 @@ class Queries_HDFS:
         return res.withColumn(nombre_val, columna.cast("double")).orderBy(columna.desc())
 
     def contar_palabras(self, ruta: str, top: int = 20) -> DataFrame:
-        """Job `wordcount` incluido en Hadoop; sirve también para comprobar que Hadoop funciona."""
+       
         def args(salida):
             return ["wordcount", self._resolver(ruta), salida]
         df = self._texto_a_df(self._correr_job(self.jar_ejemplos, args), ["palabra", "conteo"])
         return df.withColumn("conteo", F.col("conteo").cast("long")).orderBy(F.col("conteo").desc()).limit(int(top))
 
-    # =====================================================================
-    #  Operaciones de HDFS para la demostración (-cat, -get, -rm, fsck, report)
-    # =====================================================================
+   
+    #  Operaciones de HDFS para la demostración
+
     def _comando_hdfs(self, *args: str) -> list[str]:
-        """Arma `hdfs <args>` (p. ej. fsck, dfsadmin) usando el mismo prefijo que `hdfs dfs`."""
+        """Arma `hdfs <args>` """
         base = self.comando[:-1] if self.comando and self.comando[-1] == "dfs" else self.comando
         return [*base, *args]
 
     def leer_archivo(self, ruta: str, lineas: int = 10) -> DataFrame:
-        """`hdfs dfs -cat <ruta>`: primeras `lineas` líneas (no descarga el archivo completo)."""
+        """`hdfs dfs -cat <ruta>`"""
         proceso = subprocess.Popen(
             [*self.comando, "-cat", self._resolver(ruta)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
@@ -340,11 +291,11 @@ class Queries_HDFS:
         return self.spark.createDataFrame(filas, StructType([StructField("linea", StringType())]))
 
     def descargar(self, ruta_hdfs: str, destino_local: str) -> None:
-        """`hdfs dfs -get <ruta_hdfs> <destino_local>` (destino = ruta vista por el comando, p. ej. dentro del contenedor)."""
+        """`hdfs dfs -get <ruta_hdfs> <destino_local>`."""
         self._ejecutar("-get", "-f", self._resolver(ruta_hdfs), self._validar_local(destino_local))
 
     def eliminar(self, ruta: str, recursivo: bool = False) -> None:
-        """`hdfs dfs -rm [-r] <ruta>`. Úsalo solo sobre carpetas de prueba."""
+        """`hdfs dfs -rm [-r] <ruta>`"""
         ruta = self._resolver(ruta)
         if ruta.rstrip("/").endswith("/data") or ruta.rstrip("/") in ("", "/", "hdfs://namenode:9000"):
             raise ValueError("No se permite borrar la carpeta raíz de los datos")
@@ -367,7 +318,7 @@ class Queries_HDFS:
         return self.spark.createDataFrame(filas, esquema)
 
     def resumen_cluster(self) -> DataFrame:
-        """Estado del clúster (`hdfs dfsadmin -report` y `fsck`): datanodes vivos, bloques, replicación."""
+        """Estado del clúster datanodes vivos, bloques, replicación."""
         r = subprocess.run(self._comando_hdfs("dfsadmin", "-report"), capture_output=True, text=True, timeout=self.timeout)
         buscar = {
             "Datanodes vivos": r"Live datanodes \((\d+)\)",
@@ -383,10 +334,9 @@ class Queries_HDFS:
             filas.append((nombre, m.group(1) if m else None))
         return self.spark.createDataFrame(filas, "metrica STRING, valor STRING")
 
-    # =====================================================================
-    #  Consultas obligatorias de Hadoop (MapReduce sobre el texto limpio)
-    # =====================================================================
-    # Texto limpio generado desde los Parquet de processed (CSV sin encabezado, posición de columnas):
+    #  Consultas obligatorias de Hadoop 
+  
+  
     TEXTO = {
         "contaminacion": "contaminacion",   # 1 sensor_id, 2 fecha_utc, 3 valor, 4 zona
         "clima": "clima",                   # 1 dev_id, 2 fecha_utc, 3 temperatura (°C)
@@ -406,8 +356,6 @@ class Queries_HDFS:
     def preparar_texto(self) -> DataFrame:
         """
         Genera el texto limpio que lee MapReduce a partir de los Parquet de la capa processed.
-        MapReduce (Hadoop Streaming) no lee Parquet, y así sus resultados salen de los mismos
-        datos limpios que usan PostgreSQL y MongoDB. Se puede repetir sin problema (sobrescribe).
         Devuelve un DataFrame con las filas escritas por dataset.
         """
         sp = Queries_SP(self.spark, self.base_uri)
@@ -467,12 +415,7 @@ class Queries_HDFS:
     def _resumen(self, dataset: str, col_clave: int, col_valor: int, col_fecha: int | None = None,
                  fecha_ini: str | None = None, fecha_fin: str | None = None,
                  etiqueta_total: str | None = None) -> DataFrame:
-        """
-        Job MapReduce: por cada clave calcula cantidad, promedio, mínimo y máximo del valor.
-        fecha_ini y fecha_fin ('AAAA-MM-DD') filtran en el mapper por la columna `col_fecha` (días completos).
-        Con `etiqueta_total` agrega además una clave que resume todo el dataset.
-        Devuelve (clave, mediciones, promedio, minimo, maximo).
-        """
+       
         condiciones = []
         for fecha, operador, hora in ((fecha_ini, ">=", "00:00:00"), (fecha_fin, "<=", "23:59:59")):
             if fecha:
@@ -499,7 +442,7 @@ class Queries_HDFS:
         )
 
     def _nombres_sensores(self) -> DataFrame:
-        """fuente, sensor_id (texto), nombre y variable de cada sensor (de los Parquet de processed)."""
+        """fuente, sensor_id (texto), nombre y variable de cada sensor """
         sp = Queries_SP(self.spark, self.base_uri)
         cont = (
             sp._leer("contaminacion/sensores")
@@ -521,7 +464,7 @@ class Queries_HDFS:
         return cont.unionByName(clima)
 
     def _por_sensor(self, fuente: str | None, fecha_ini: str | None, fecha_fin: str | None) -> DataFrame:
-        """Resumen por sensor (contaminación y/o clima) con nombre y variable. Base de las preguntas 1, 2 y 5."""
+        """Resumen por sensor con nombre y variable. Base de las preguntas 1, 2 y 5."""
         partes = []
         for nombre in ("contaminacion", "clima"):
             if fuente in (None, nombre):
@@ -556,7 +499,7 @@ class Queries_HDFS:
 
     # 3. ¿Cuál es la temperatura promedio histórica? (clima, grados Celsius)
     def temperatura_promedio_historica(self, fecha_ini: str | None = None, fecha_fin: str | None = None) -> DataFrame:
-        """Promedio de la temperatura en °C: primero el global (sensor 'TODOS') y luego por dispositivo."""
+        """Promedio de la temperatura en °C: primero el global y luego por dispositivo."""
         df = self._resumen("clima", 1, 3, 2, fecha_ini, fecha_fin, etiqueta_total="TODOS")
         nombres = self._nombres_sensores().filter(F.col("fuente") == "clima").select(
             F.col("sensor_id").alias("clave"), "nombre"
