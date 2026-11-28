@@ -83,8 +83,8 @@ class Dashboard:
         queries_mg,
         queries_hdfs,
         filtros,
-        titulo="Dashboard de SmartCities (pruebas)",
-        icono="🧪",
+        titulo="Dashboard de SmartCities",
+        ,
     ):
         self.queries = queries
         self.queries_pg = queries_pg
@@ -93,7 +93,7 @@ class Dashboard:
         self.filtros = filtros
 
         self.titulo = titulo
-        self.icono = icono
+        
 
     # ============================================================
     # INICIALIZACIÓN Y ESTADO
@@ -2288,13 +2288,13 @@ class Dashboard:
     def run(self):
         st.set_page_config(
             page_title=self.titulo,
-            page_icon=self.icono,
+            
             layout="wide",
         )
 
         self._inicializar_estado()
 
-        st.title(f"{self.icono} {self.titulo}")
+        st.title(f"{self.titulo}")
 
         self.mostrar_filtros()
 
