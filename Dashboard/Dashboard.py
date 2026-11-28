@@ -84,7 +84,7 @@ class Dashboard:
         queries_hdfs,
         filtros,
         titulo="Dashboard de SmartCities",
-        ,
+        
     ):
         self.queries = queries
         self.queries_pg = queries_pg
